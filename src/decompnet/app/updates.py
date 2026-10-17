@@ -26,7 +26,7 @@ from pathlib import Path
 
 from .. import __version__, hostenv, toolchains
 
-REPO = "i12bp8/decomp.wtf"
+REPO = "alexander-james-gamino/decomp.wtf"  # this fork (upstream i12bp8/decomp.wtf is discontinued)
 SITE = "https://decomp.wtf"
 RECHECK = {"release": 3 * 3600, "branch": 15 * 60}  # GitHub allows 60 unauthenticated API calls an hour
 
