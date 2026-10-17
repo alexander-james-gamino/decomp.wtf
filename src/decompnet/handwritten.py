@@ -198,8 +198,17 @@ def _mips_uses(w: int) -> tuple[set[int], set[int]] | None:
     return None
 
 
-def mips_reason(code: bytes, big_endian: bool, platform: str = "") -> str | None:
-    """Why this MIPS function (its code, from the entry) can't come from a compiler, or None."""
+def uses_cop2(code: bytes, big_endian: bool) -> bool:
+    """Whether MIPS code has coprocessor 2 instructions (the PlayStation's GTE, the PS2's VU0)."""
+    order = "big" if big_endian else "little"
+    return any((w >> 26) == 0x12 or (w >> 26) in (0x32, 0x3A, 0x36, 0x3E)
+               for w in (int.from_bytes(code[at:at + 4], order) for at in range(0, len(code) - 3, 4)))
+
+
+def mips_reason(code: bytes, big_endian: bool, platform: str = "", cop2: bool = True) -> str | None:
+    """Why this MIPS function (its code, from the entry) can't come from a compiler, or None.
+    cop2=False skips the coprocessor 2 rule: for a game whose C reaches the GTE/VU0 through inline asm macros
+    (it has matched functions that use it)."""
     order = "big" if big_endian else "little"
     words = [int.from_bytes(code[at:at + 4], order) for at in range(0, len(code) - 3, 4)]
     if not words:
@@ -208,7 +217,7 @@ def mips_reason(code: bytes, big_endian: bool, platform: str = "") -> str | None
         op = w >> 26
         if op == 0x10:
             return "uses coprocessor 0 (the system's: mfc0, mtc0, rfe, eret): no C compiler emits it"
-        if platform in ("psx", "ps", "ps2") and (op == 0x12 or op in (0x32, 0x3A, 0x36, 0x3E)):
+        if cop2 and platform in ("psx", "ps", "ps2") and (op == 0x12 or op in (0x32, 0x3A, 0x36, 0x3E)):
             unit = "the GTE (coprocessor 2)" if platform != "ps2" else "VU0 (coprocessor 2)"
             return (f"uses {unit}: no C compiler emits it (PSY-Q's libgte is written in assembly; C does it with "
                     "inline asm)" if platform != "ps2" else f"uses {unit}: C reaches it only through inline asm")

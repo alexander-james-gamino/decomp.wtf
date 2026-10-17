@@ -755,6 +755,7 @@ function renderStats(ov) {
   $("pctSub").textContent = (ov.bytes ? `${bytes(ov.matched_bytes)} of ${bytes(ov.bytes)}` : "") + linkedText(ov) + (S.today ? ` · ${S.today} matched today` : "");
   $("fnCount").textContent = `${ov.matched.toLocaleString()} / ${ov.functions.toLocaleString()}`;
   renderAutopilot(ov);
+  renderPermuter(ov);
   renderSteering(ov);
   if (S.tab === "source") renderSource(ov);
   renderCompilerNotice(ov);
@@ -2276,7 +2277,7 @@ function renderAutopilot(ov) {
   const twinsRunning = tw && tw.state === "running";
   box.classList.toggle("on", !!(running || twinsRunning));
   $("apBar").hidden = !running || ap.phase === "twins";
-  const perm = pm && (pm.tried || pm.state === "running")
+  const perm = pm && pm.mode !== "decomp-permuter" && (pm.tried || pm.state === "running")
     ? ` The permuter ${pm.state === "running" ? `is rewriting near misses${pm.current ? ` (now ${pm.current})` : ""}` : "rewrote near misses"}: ${plural(pm.tried, "function")}, ${pm.matched} matched.` : "";
   const twinsDone = (ap && ap.twins) || (tw && tw.matched) || 0;
   if (running && ap.phase === "twins") {
@@ -2311,6 +2312,56 @@ function renderAutopilot(ov) {
       S.ov = await api("/api/autopilot", { method: "POST", body: { slug: S.slug, action: running ? "stop" : "start" } });
       renderAutopilot(S.ov);
     } catch (e) { toast(esc(e.message), "err"); } finally { $("apBtn").disabled = false; }
+  };
+}
+
+/* Permuter (a project's own decomp-permuter worker): the close calls agents leave, on spare CPU, from this button.
+   It claims each function (agents work elsewhere meanwhile), submits through the judge and stops when none are left. */
+const PM_KEY = "permuterOptions";
+function renderPermuter(ov) {
+  const box = $("permuter"), pm = ov.permuter;
+  box.hidden = !pm || pm.mode !== "decomp-permuter" || !pm.available;
+  if (box.hidden) return;
+  if (!box.dataset.init) {  // the last options, once: never overwrite what's being typed
+    box.dataset.init = "1";
+    let o = {};
+    try { o = JSON.parse(localStorage.getItem(PM_KEY) || "{}"); } catch (e) { o = {}; }
+    if (o.minutes) $("pmMin").value = o.minutes;
+    if (o.threads != null) $("pmThr").value = o.threads;
+    if (o.max_score) $("pmMax").value = o.max_score;
+    if (o.functions) $("pmFns").value = o.functions;
+  }
+  const running = pm.state === "running";
+  box.classList.toggle("on", running);
+  $("pmOpts").hidden = running;
+  $("pmBar").hidden = !running || !pm.total;
+  const won = pm.matched ? ` · <span class="ok">${pm.matched} matched</span>` : "";
+  if (running) {
+    const o = pm.options || {};
+    $("pmTitle").innerHTML = `Permuter: ${pm.current ? `working on ${esc(pm.current)} (best ${pm.current_best})` : "picking the next close call"}${won}`;
+    $("pmSub").textContent = `${pm.tried} of ${pm.total || "?"} close calls tried · ${o.minutes} min each, best score ≤ ${o.max_score}${o.functions ? ` · only ${o.functions}` : ""}. It holds each function, so agents work elsewhere.`;
+    $("pmBar").firstElementChild.style.width = `${(100 * pm.tried) / Math.max(1, pm.total)}%`;
+    $("pmBtn").textContent = "Stop";
+  } else if (pm.state) {
+    const how = pm.state === "failed" ? "stopped with an error" : pm.state === "stopped" ? "stopped" : "finished";
+    $("pmTitle").innerHTML = `Permuter ${how}${won}`;
+    $("pmSub").textContent = pm.state === "failed" ? (pm.error || "")
+      : `${plural(pm.tried, "close call")} tried${pm.matched_names && pm.matched_names.length ? `: matched ${pm.matched_names.join(", ")}` : ""}. A function is tried again only after someone improves it.`;
+    $("pmBtn").textContent = "Run again";
+  } else {
+    $("pmTitle").textContent = "Permuter for close calls";
+    $("pmSub").textContent = "Runs decomp-permuter on functions whose C is right but registers or order differ: it holds each one, submits improvements through the judge and stops when none are left.";
+    $("pmBtn").textContent = "Run permuter";
+  }
+  $("pmBtn").onclick = async () => {
+    $("pmBtn").disabled = true;
+    const opts = { minutes: Number($("pmMin").value) || 10, threads: Number($("pmThr").value) || 0,
+                   max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim() };
+    try { localStorage.setItem(PM_KEY, JSON.stringify(opts)); } catch (e) { /* not kept: fine */ }
+    try {
+      S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: running ? "stop" : "start", ...opts } });
+      renderPermuter(S.ov);
+    } catch (e) { toast(esc(e.message), "err"); } finally { $("pmBtn").disabled = false; }
   };
 }
 

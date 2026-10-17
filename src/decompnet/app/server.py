@@ -639,6 +639,16 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
             net.start_autopilot(slug)
         return net.overview(slug)
 
+    def p_permuter(slug, request, data):
+        """The Permuter button: a project's own worker (decomp-permuter) with the options shown next to it."""
+        if data.get("action") == "stop":
+            net.permuter.stop(slug)
+        else:
+            opts = {k: data.get(k) for k in ("minutes", "threads", "max_score", "functions")}
+            if net.permuter.start(slug, opts, manual=True) is None:
+                raise ValueError("this project has no permuter worker (tools/permute/dp_worker.py)")
+        return net.overview(slug)
+
     routes = {
         "/api/project": (p_overview, ["GET"]),
         "/api/live": (p_live, ["GET"]),
@@ -648,7 +658,8 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         "/api/compiler": (p_compiler, ["POST"]), "/api/export": (p_export, ["POST"]), "/api/open": (p_open, ["POST"]),
         "/api/delete": (p_delete, ["POST"]), "/api/agents/manual": (p_manual, ["POST"]),
         "/api/try": (p_try, ["POST"]), "/api/release": (p_release, ["POST"]),
-        "/api/autopilot": (p_autopilot, ["POST"]), "/api/instructions": (p_instructions, ["POST"]),
+        "/api/autopilot": (p_autopilot, ["POST"]), "/api/permuter": (p_permuter, ["POST"]),
+        "/api/instructions": (p_instructions, ["POST"]),
         "/api/priority": (p_priority, ["POST"]), "/api/note": (p_note, ["POST"]),
         "/api/stats": (lambda s, r, d: net.stats(s), ["GET"]),
     }

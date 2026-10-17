@@ -27,7 +27,7 @@ from io import BytesIO
 from pathlib import Path
 
 from ..elfobj import _MASKS, Reloc, mask_relocs
-from ..handwritten import mips_reason, ppc_reason
+from ..handwritten import mips_reason, ppc_reason, uses_cop2
 from ..network import NetworkError
 
 log = logging.getLogger("decomp.wtf")
@@ -392,9 +392,13 @@ class Twins:
         if (proj["arch"] or "mips") != "mips":
             return 0
         platform, big = self.net.cfg(proj).get("platform", ""), bool(proj["big_endian"])
+        # a game whose matched C already uses the GTE/VU0 (inline asm macros in its headers) compiles such code:
+        # coprocessor 2 is no sign of hand-written assembly there
+        cop2 = not any(uses_cop2(r["target"] or b"", big) for r in self.net.store.all(
+            "SELECT target FROM functions WHERE project_id=? AND status='matched'", proj["id"]))
         marks = []
         for r in self.net.store.all("SELECT id, target, meta FROM functions WHERE project_id=? AND status='open'", proj["id"]):
-            if (why := mips_reason(r["target"] or b"", big, platform)):
+            if (why := mips_reason(r["target"] or b"", big, platform, cop2)):
                 marks.append((json.dumps({**json.loads(r["meta"] or "{}"), "asm_code": why}), r["id"]))
         if marks:
             with self.net.store.tx() as db:

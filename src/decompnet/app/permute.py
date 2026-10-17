@@ -8,15 +8,27 @@ agents left (or autopilot's drafts reached): it holds a function for a minute at
 wants it gets it next, records every improvement as the function's best attempt (agents start from it), and
 a match as a match. Rewrites keep the meaning of the code (see permuter.py); what matches is still judged
 byte for byte, like everything else.
+
+A project can bring its own worker instead (mode "decomp-permuter"): the project config's `permuter.cmd`, or
+<project root>/tools/permute/dp_worker.py run by $DECOMP_PERMUTER_PYTHON (default
+~/Decomp/tools/decomp-permuter/.venv/bin/python). It runs only from the Permuter button, with the options shown
+there, claims each function through this app, submits through the same judge, prints `PROGRESS <json>` lines
+(events start/more/function/result/done) and exits when nothing is left; Stop sends it SIGTERM.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import random
+import re
+import signal
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .. import scoring
 from ..network import NetworkError
@@ -26,6 +38,7 @@ log = logging.getLogger("decomp.wtf")
 NEAR = 0.06  # a near miss: at most this much of the function differs (best_score <= 6% of n_insns * 100)
 SECONDS = 60  # per function per turn
 MAX_TURNS = 4  # turns per function before it's left to agents
+EXTERNAL = "decomp-permuter"
 
 
 @dataclass
@@ -38,6 +51,15 @@ class State:
     current: str = ""
     started_at: float = field(default_factory=time.time)
     stop: threading.Event = field(default_factory=threading.Event)
+    # an external worker (mode "decomp-permuter")
+    mode: str = "built-in"
+    total: int = 0
+    current_best: int | None = None
+    matched_names: list = field(default_factory=list)
+    options: dict = field(default_factory=dict)
+    log: list = field(default_factory=list)
+    error: str = ""
+    proc: subprocess.Popen | None = None
 
 
 class Permuter:
@@ -46,17 +68,39 @@ class Permuter:
         self.jobs: dict[str, State] = {}
         self._turns: dict[int, int] = {}  # function id -> turns spent on it
 
+    def external_cmd(self, slug: str) -> list[str] | None:
+        """The project's own permuter worker, if it has one (see the module docstring)."""
+        try:
+            proj = self.net.project_row(slug)
+        except NetworkError:
+            return None
+        if self.net.fork_slug(slug) or not proj["root"]:
+            return None
+        cmd = (self.net.cfg(proj).get("permuter") or {}).get("cmd")
+        if cmd:
+            return [str(c) for c in cmd]
+        script = Path(proj["root"]) / "tools/permute/dp_worker.py"
+        py = Path(os.environ.get("DECOMP_PERMUTER_PYTHON")
+                  or Path.home() / "Decomp/tools/decomp-permuter/.venv/bin/python")
+        return [str(py), "-I", str(script)] if script.is_file() and py.is_file() else None
+
     def status(self, slug: str) -> dict | None:
         st = self.jobs.get(slug)
-        return None if st is None else {k: v for k, v in st.__dict__.items() if k != "stop"}
+        if st is None:
+            return {"state": None, "mode": EXTERNAL, "available": True} if self.external_cmd(slug) else None
+        out = {k: v for k, v in st.__dict__.items() if k not in ("stop", "proc")}
+        out["available"] = st.mode == EXTERNAL or self.external_cmd(slug) is not None
+        return out
 
-    def start(self, slug: str) -> State | None:
+    def start(self, slug: str, options: dict | None = None, manual: bool = False) -> State | None:
         """Run on the project's near misses until there are none (looking again every few minutes while the
-        app runs: agents make new ones)."""
+        app runs: agents make new ones). A project's own worker runs only when asked for (manual)."""
         if (st := self.jobs.get(slug)) is not None and st.state == "running":
             return st
         if slug in self.net.links:  # a room member: the host's copy permutes, and its matches come back here
             return None
+        if (cmd := self.external_cmd(slug)) is not None:
+            return self._start_external(slug, cmd, options or {}) if manual else None
         st = self.jobs[slug] = State()
         threading.Thread(target=self._loop, args=(slug, st), daemon=True, name=f"permuter-{slug}").start()
         return st
@@ -64,6 +108,62 @@ class Permuter:
     def stop(self, slug: str) -> None:
         if (st := self.jobs.get(slug)) is not None:
             st.stop.set()
+            if st.proc is not None and st.proc.poll() is None:
+                try:
+                    os.killpg(st.proc.pid, signal.SIGTERM)  # the worker releases its claim and stops its permuter
+                except ProcessLookupError:
+                    pass
+
+    # ------------------------------------------------------------------ an external worker (decomp-permuter)
+
+    def _start_external(self, slug: str, cmd: list[str], options: dict) -> State:
+        minutes = min(max(float(options.get("minutes") or 10), 0.5), 240)
+        max_score = min(max(int(options.get("max_score") or 150), 1), 1_000_000)
+        threads = min(max(int(options.get("threads") or 0), 0), 128)
+        names = ",".join(re.findall(r"[A-Za-z_]\w*", str(options.get("functions") or "")))
+        db = self.net.store.conn.execute("PRAGMA database_list").fetchone()[2]  # the worker uses this app's data
+        args = ["--progress", "--db", db, "--minutes", f"{minutes:g}", "--max-score", str(max_score)]
+        args += ["--threads", str(threads)] if threads else []
+        args += ["--functions", names] if names else []
+        st = State(mode=EXTERNAL, options={"minutes": minutes, "threads": threads, "max_score": max_score,
+                                           "functions": names})
+        st.proc = subprocess.Popen(cmd + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   bufsize=1, start_new_session=True)
+        self.jobs[slug] = st
+        threading.Thread(target=self._read_external, args=(st,), daemon=True, name=f"permuter-{slug}").start()
+        return st
+
+    def _read_external(self, st: State) -> None:
+        for line in st.proc.stdout:
+            line = line.rstrip("\n")
+            if not line.startswith("PROGRESS "):
+                if line.strip():
+                    st.log = (st.log + [line])[-30:]
+                continue
+            try:
+                ev = json.loads(line[9:])
+            except ValueError:
+                continue
+            kind = ev.get("event")
+            if kind in ("start", "more"):
+                st.total = ev.get("total", st.total)
+            elif kind == "function":
+                st.current, st.current_best = ev.get("name") or "", ev.get("best")
+            elif kind == "result":
+                st.tried = ev.get("done", st.tried + 1)
+                st.current = ""
+                if ev.get("matched"):
+                    st.matched += 1
+                    st.matched_names = (st.matched_names + [ev.get("name")])[-50:]
+        st.proc.wait()
+        st.current = ""
+        if st.stop.is_set():
+            st.state = "stopped"
+        elif st.proc.returncode:
+            st.state = "failed"
+            st.error = st.log[-1] if st.log else f"the worker exited with {st.proc.returncode}"
+        else:
+            st.state = "done"
 
     def candidates(self, proj, limit: int = 20) -> list:
         return [r for r in self.net.store.all(

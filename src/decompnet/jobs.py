@@ -67,11 +67,19 @@ def submit(net: Network, agent: Agent, project: str, function: str, source: str)
     proj = net.store.one("SELECT * FROM projects WHERE id=?", fn["project_id"])
     ctx = net._context(proj["id"], fn["unit"])
     res = net._compile(proj, ctx["header"], source)
-    cand = extract_function(res.obj, fn["name"]) if res.ok else None
+    verdict = None
+    if res.ok and hasattr(net, "_evaluate"):
+        # judged like an agent's attempt: linked at the function's address, so section-relative relocations
+        # (a $gp variable defined in the file is `.sbss`+n until linked) compare as the symbols they are
+        cand, verdict, _ = net._evaluate(fn, proj, res.obj)
+    else:
+        cand = extract_function(res.obj, fn["name"]) if res.ok else None
     if cand is None:
         net._record(fn, agent, None, source, ctx["version"], via="permuter")
         return {"accepted": False, "reason": "did not compile on the coordinator"}
     d = scoring.diff(net._target_obj(fn, proj), cand)
+    if verdict is not None:
+        d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
     before = fn["best_score"]
     net._record(fn, agent, d.score, source, ctx["version"], matched=d.bytes_match, via="permuter")
     if d.bytes_match:
