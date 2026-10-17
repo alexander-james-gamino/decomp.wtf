@@ -62,9 +62,9 @@ functions of the same game at the same time; the tools keep you from colliding.
 Your job: turn functions of this game into C that compiles to *exactly* the original machine code.
 Use only the decomp tools. Repeat for up to {count} claims (a batch is one), then stop:
 
-1. claim_function(count=4) gives you the next function, and when it's small, its neighbours with it (small
-   functions mostly match on the first try): assembly, location, calls, data it uses, the best previous
-   attempt and notes (start from those!), a machine-generated draft, and identical matched code if any.
+1. claim_function(count=4) gives you the next function that suits you, and when it's small, its neighbours
+   with it (small functions mostly match on the first try): assembly, location, calls, data it uses, the best
+   previous attempt and notes (start from those!), a machine-generated draft, and identical matched code if any.
 2. get_context() shows the shared header every compile includes.
 3. Write the C functions (same names as the assembly) and judge them: compile_and_diff(function="a, b, c",
    source=all the definitions) for a batch, one name for one. Read the diff: '<' '>' missing/extra
@@ -74,10 +74,14 @@ Use only the decomp tools. Repeat for up to {count} claims (a batch is one), the
 4. Score 0 = matched and saved. Before moving on, share what you learned: edit_context for prototypes and
    structs you worked out, rename_symbol for functions/data whose purpose is now clear, and add_note (no
    function) for a compiler quirk or convention every agent here should know: the next sessions start with it.
-5. compile_and_diff says when to move on (no better after 4 compiles in a row; up to 10 for big functions):
-   then release_function with precise notes (what you tried, what is left) and claim the next one.
+5. compile_and_diff says when to move on (no better after a few compiles in a row; more for big functions):
+   then release_function with precise notes (what you tried, what is left) and claim the next one. Only
+   registers or instruction order differ: release_function with leave_for="permuter". Every instruction matches
+   but data still differs and you've checked your data: leave_for="human", saying what you checked.
 
-Write plausible original code, pure C (no inline asm). Be brief in your messages: work, don't narrate.
+A switch's case numbers come only from its jump table: read_data the jtbl_ address and label each case by where
+its entry points (bodies can be shared or fall through). Write plausible original code, pure C (no inline asm).
+Be brief in your messages: work, don't narrate.
 """
 
 FORK_PROMPT = """\
@@ -153,7 +157,7 @@ def _claim(net: RomNetwork, agent: Agent, slug: str, function: str, strategy: st
     """A claim; one asked for that's matched, hand-written assembly or someone else's is the next free function
     instead (an agent asking for those has nothing better to do than the next one, and is told why). count > 1: a
     batch of small ones."""
-    strategy = strategy or ("finish" if net.fork_slug(slug) else "easiest")
+    strategy = strategy or ("finish" if net.fork_slug(slug) else net.default_strategy(agent, slug))
     if not function and int(count or 1) > 1:
         return net.claim_many(agent, slug, int(count), strategy)
     try:
@@ -178,7 +182,8 @@ HANDLERS: dict[str, Callable[..., str]] = {
         _claim(net, agent, slug, function, strategy, count),
     "get_function": lambda net, agent, slug, function: net.get_function(function, slug, agent),
     "compile_and_diff": lambda net, agent, slug, function, source: _compile(net, agent, slug, function, source),
-    "release_function": lambda net, agent, slug, function, notes: net.release(agent, function, notes, slug),
+    "release_function": lambda net, agent, slug, function, notes, leave_for="":
+        net.release(agent, function, notes, slug, leave_for),
     "get_context": lambda net, agent, slug, function="": net.get_context(slug, function or None),
     "edit_context": lambda net, agent, slug, old, new, message, function="":
         net.edit_context(agent, slug, old, new, message, function or None),
@@ -186,7 +191,7 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "split_function": lambda net, agent, slug, function, at, new_name="":
         net.split_function(agent, slug, function, at, new_name),
     "read_data": lambda net, agent, slug, what, length=64: (net.forks.read_data(agent, slug, what, length)
-                                                            if net.fork_slug(slug) else net.read_data(slug, what, length)),
+                                                            if net.fork_slug(slug) else net.read_data(slug, what, length, agent)),
     "list_functions": lambda net, agent, slug, status="open", limit=40: net.list_functions(slug, status, limit),
     "add_note": lambda net, agent, slug, text, function="": net.add_note(agent, slug, text, function or None),
     "search_notes": lambda net, agent, slug, query: net.search_notes(slug, query),
@@ -266,8 +271,9 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]])
 
         Args:
             function: optional name or address (0x80001234) of a specific function
-            strategy: finish (forks' default: the files closest to being linked first), easiest (fewest
-                instructions; ROM projects' default), closest (nearly matched already), hardest, random
+            strategy: leave empty: you get what suits your model. Or finish (files closest to being linked
+                first), easiest (fewest instructions), closest (nearly matched already), frontier (what
+                weaker models can't do), hardest, random
             count: up to 6: small functions come as a batch (neighbours in one file) to write together and
                 judge in one compile_and_diff; a big one comes alone
         """
@@ -291,10 +297,15 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]])
         return await run(ctx, "compile_and_diff", function=function, source=source)
 
     @mcp.tool(meta=ALWAYS_LOAD)
-    async def release_function(ctx: Context, function: str, notes: str) -> str:
+    async def release_function(ctx: Context, function: str, notes: str, leave_for: str = "") -> str:
         """Give up a function you're stuck on. Notes are required: what you tried, what is left. Your best
-        attempt is kept for the next agent."""
-        return await run(ctx, "release_function", function=function, notes=notes)
+        attempt is kept for the next agent.
+
+        Args:
+            leave_for: "permuter" when only registers or instruction order differ (no agent gets it until the
+                permuter has tried), "human" when it can't match for a reason C can't fix (a tool problem).
+        """
+        return await run(ctx, "release_function", function=function, notes=notes, leave_for=leave_for)
 
     @mcp.tool(meta=ALWAYS_LOAD)
     async def get_context(ctx: Context, function: str = "") -> str:
@@ -327,7 +338,7 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]])
 
     @mcp.tool(meta=ALWAYS_LOAD)
     async def list_functions(ctx: Context, status: str = "open", limit: int = 40) -> str:
-        """List functions by status: open, matched or all."""
+        """List functions by status: open, matched or all; permuter or human: what was left for them, and why."""
         return await run(ctx, "list_functions", status=status, limit=limit)
 
     @mcp.tool(meta=ALWAYS_LOAD)

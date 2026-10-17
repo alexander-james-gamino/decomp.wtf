@@ -80,6 +80,20 @@ class Segment:
     def contains(self, address: int, length: int = 1) -> bool:
         return self.vram <= address and address + length <= self.vram + (self.rom_end - self.rom_start)
 
+    def overlaps(self, other: "Segment") -> bool:
+        """Whether both take up some of the same addresses (overlays a game loads into the same place)."""
+        return (other is not self and self.vram < other.vram + (other.rom_end - other.rom_start)
+                and other.vram < self.vram + (self.rom_end - self.rom_start))
+
+
+def visible_segments(segments: list[Segment], rom_offset: int | None = None) -> list[Segment]:
+    """The segments code at `rom_offset` can see, in the order to look an address up: its own first, then every
+    segment no other one overlaps (the main program). Never another overlay loaded at the same address: only one of
+    them is in memory at a time, so its bytes there aren't the ones this code reads."""
+    home = next((s for s in segments if rom_offset is not None and s.rom_start <= rom_offset < s.rom_end), None)
+    alone = [s for s in segments if s is not home and not any(s.overlaps(o) for o in segments)]
+    return ([home] if home is not None else []) + alone
+
 
 @dataclass
 class SplitResult:

@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import policy, scoring
+from . import policy, scoring, tiers
 from .compiler import compile_source
 from .elfobj import FunctionObj, Reloc, extract_function
 from .project import compiler_config
@@ -43,7 +43,18 @@ STRATEGIES = {
     "closest": "f.best_score IS NULL, f.abandons ASC, CAST(f.best_score AS REAL) / (f.n_insns * 100) ASC",
     "hardest": "f.n_insns DESC",
     "random": "RANDOM()",
+    # a large model's order when weaker ones are working too (tiers.py): near misses that still differ in real code
+    # first, closest to done first; then fresh functions, small first. Register-allocation near misses go last:
+    # the permuter's
+    "frontier": "(COALESCE(f.best_kind, '') = 'regalloc' AND f.best_score > 0) ASC, "
+                "(f.best_score > 0 AND COALESCE(f.best_kind, '') = 'structure') DESC, f.best_score IS NULL, "
+                "CAST(f.best_score AS REAL) / (f.n_insns * 100) ASC, f.n_insns ASC",
 }
+# Runs of the permuter on a function that didn't match before it goes back to the agents (handoff cleared).
+PERMUTER_TURNS = 3
+# Agents that claimed, released or matched something this recently count as working (for the division of labour).
+ACTIVE_WINDOW = 20 * 60
+LEAVE_FOR = ("permuter", "human")
 
 
 class NetworkError(Exception):
@@ -276,37 +287,229 @@ class Network:
                 if other is not None:
                     raise NetworkError(f"{fn['name']} is claimed by {self._agent_name(other['agent_id'])} "
                                        f"for another {int(other['expires_at'] - now) // 60} min")
+                if fn["handoff"] == "human":  # asked for by name: somebody is looking at it now
+                    db.execute("UPDATE functions SET handoff=NULL, handoff_note=?, handoff_at=? WHERE id=?",
+                               (f"taken back by {agent.name}", now, fn["id"]))
                 db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + self.claim_ttl))
                 self._event(db, fn["project_id"], agent.id, "claim", fn["name"])
             else:
-                fn = db.execute(
-                    f"""SELECT f.* FROM functions f WHERE f.project_id=? AND f.status='open'
-                        AND f.id NOT IN (SELECT function_id FROM claims)
-                        AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release')
-                        ORDER BY f.name IN (SELECT detail FROM events WHERE project_id=? AND kind='release'
-                                            AND created_at > ?), {STRATEGIES[strategy]} LIMIT 1""",
-                    (proj["id"], proj["id"], agent.id, proj["id"], now - RELEASE_COOLDOWN),
-                ).fetchone()
+                fn = self._next_for(db, agent, proj, strategy, now)
                 if fn is None:
                     return None
                 db.execute("INSERT INTO claims VALUES(?,?,?,?)", (fn["id"], agent.id, now, now + self.claim_ttl))
                 self._event(db, fn["project_id"], agent.id, "claim", fn["name"])
         return fn
 
-    def release(self, agent: Agent, function: str, notes: str, project: str | None = None) -> str:
+    # ------------------------------------------------------------- who gets what (tiers.py)
+
+    def tier_of(self, agent: Agent | int) -> str | None:
+        row = self.store.one("SELECT tier FROM agents WHERE id=?", agent if isinstance(agent, int) else agent.id)
+        return row["tier"] if row else None
+
+    def set_agent_tier(self, agent_id: int, tier: str | None) -> None:
+        """What a helper's model can take on (tiers.detect); None: unknown, no routing."""
+        with self.store.tx() as db:
+            db.execute("UPDATE agents SET tier=? WHERE id=?", (tier if tier in tiers.TIERS else None, agent_id))
+
+    def default_strategy(self, agent: Agent, project: str | None) -> str:
+        """The claim order an agent gets when it doesn't ask for one: its tier's, else the usual."""
+        t = tiers.get(self.tier_of(agent))
+        return t.strategy if t else "easiest"
+
+    def _active_tiers(self, db, project_id: int, agent_id: int, now: float) -> set[str]:
+        """Tiers of the other agents working on the project right now (holding a claim, or busy lately)."""
+        rows = db.execute(
+            "SELECT DISTINCT a.tier FROM agents a WHERE a.tier IS NOT NULL AND a.id != ? AND a.id IN ("
+            " SELECT c.agent_id FROM claims c JOIN functions f ON f.id=c.function_id WHERE f.project_id=?"
+            " UNION SELECT e.agent_id FROM events e WHERE e.project_id=? AND e.created_at > ?)",
+            (agent_id, project_id, project_id, now - ACTIVE_WINDOW)).fetchall()
+        return {r["tier"] for r in rows}
+
+    def _eligible(self, db, agent: Agent, proj, now: float, relax: bool = False) -> tuple[str, list, str]:
+        """(WHERE clause, its parameters, ORDER BY prefix) for what this agent may be handed automatically.
+
+        Everyone: open, unclaimed, not given up on by this agent, not left for the permuter or a human.
+        By tier: what fits it (size, how often others gave up), register-allocation near misses wait for the
+        permuter (the cheaper tiers never take them), and a tier above one that's working takes what that one
+        can't (the ORDER BY prefix). relax: the size and give-up caps dropped (no stronger tier is around)."""
+        t = tiers.get(self.tier_of(agent))
+        where = ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims) "
+                 "AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release') "
+                 "AND f.handoff IS NULL")
+        params: list = [proj["id"], proj["id"], agent.id]
+        prefix = ""
+        if t is None:
+            return where, params, prefix
+        if t.name != "large":
+            where += (" AND NOT (COALESCE(f.best_kind, '') = 'regalloc' AND f.best_score > 0 "
+                      "AND f.permuter_turns < ?)")
+            params.append(PERMUTER_TURNS)
+        if t.name in ("local", "small"):
+            where += " AND f.permuter_turns = 0"
+        if not relax:
+            if t.max_insns is not None:
+                where += " AND f.n_insns <= ?"
+                params.append(t.max_insns)
+            if t.max_abandons is not None:
+                where += " AND f.abandons <= ?"
+                params.append(t.max_abandons)
+        below = [n for n in self._active_tiers(db, proj["id"], agent.id, now) if tiers.stronger(t.name, n)]
+        if below:  # take what the strongest tier working below this one can't
+            lower = tiers.TIERS[max(below, key=tiers.ORDER.index)]
+            beyond = []
+            if lower.max_insns is not None:
+                beyond.append(f"f.n_insns > {int(lower.max_insns)}")
+            if lower.max_abandons is not None:
+                beyond.append(f"f.abandons > {int(lower.max_abandons)}")
+            if beyond:
+                prefix = f"({' OR '.join(beyond)}) DESC, "
+        return where, params, prefix
+
+    def _next_for(self, db, agent: Agent, proj, strategy: str, now: float):
+        t = tiers.get(self.tier_of(agent))
+        if strategy == "frontier" and not (t and any(tiers.stronger(t.name, n) for n in
+                                                     self._active_tiers(db, proj["id"], agent.id, now))):
+            strategy = "easiest"  # nobody weaker is working: no frontier to keep to, so the usual order
+        for relax in (False, True):
+            if relax and not self._may_relax(db, agent, proj, now):
+                return None
+            where, params, prefix = self._eligible(db, agent, proj, now, relax)
+            row = db.execute(
+                f"""SELECT f.* FROM functions f WHERE {where}
+                    ORDER BY f.name IN (SELECT detail FROM events WHERE project_id=? AND kind='release'
+                                        AND created_at > ?), {prefix}{STRATEGIES[strategy]} LIMIT 1""",
+                (*params, proj["id"], now - RELEASE_COOLDOWN)).fetchone()
+            if row is not None or t is None:
+                return row
+        return None
+
+    def _may_relax(self, db, agent: Agent, proj, now: float) -> bool:
+        """When nothing fits a tier's caps: a medium model takes bigger work if no large one is around; the small
+        tiers never do (they'd only burn compiles: start a stronger model for the rest)."""
+        t = tiers.get(self.tier_of(agent))
+        if t is None or t.name in ("local", "small"):
+            return False
+        return not any(tiers.stronger(n, t.name) for n in self._active_tiers(db, proj["id"], agent.id, now))
+
+    def left_for(self, agent: Agent, project: str, include_claimed: bool = True) -> int:
+        """How many open functions this agent could still be handed (its tier's caps, relaxed when allowed).
+        include_claimed: count ones others hold now too (they may come back)."""
+        proj = self._project(project)
+        now = time.time()
+        with self.store.lock:
+            db = self.store.conn
+            for relax in (False, True):
+                if relax and not self._may_relax(db, agent, proj, now):
+                    break
+                where, params, _ = self._eligible(db, agent, proj, now, relax)
+                if include_claimed:
+                    where = where.replace("AND f.id NOT IN (SELECT function_id FROM claims) ", "")
+                n = db.execute(f"SELECT COUNT(*) AS n FROM functions f WHERE {where}", params).fetchone()["n"]
+                if n:
+                    return n
+        return 0
+
+    def fits(self, agent: Agent, fn) -> bool:
+        """Whether a function suits the agent's tier for an automatic claim (the user's priority list included)."""
+        t = tiers.get(self.tier_of(agent))
+        if fn["handoff"]:
+            return False
+        if t is None or t.name == "large":
+            return True
+        if (fn["best_kind"] or "") == "regalloc" and (fn["best_score"] or 0) > 0 and fn["permuter_turns"] < PERMUTER_TURNS:
+            return False
+        if t.name in ("local", "small") and fn["permuter_turns"]:
+            return False
+        return ((t.max_insns is None or (fn["n_insns"] or 0) <= t.max_insns)
+                and (t.max_abandons is None or fn["abandons"] <= t.max_abandons))
+
+    # ------------------------------------------------------------- the permuter's queue
+
+    def permuter_queue(self, proj, limit: int = 20, max_score: int | None = None, near: float = 0.06,
+                       max_insns: int = 400) -> list:
+        """What the permuter should run on next, best bets first: functions agents left for it, then near misses
+        whose diff is registers/order only (the server sees that on every compile), then the closest near misses.
+        Fresh ones (fewer permuter runs) before ones it already tried; never data-only differences (no rewrite of
+        the code fixes those) or what was left for a human."""
+        sql = ("SELECT * FROM functions WHERE project_id=? AND status='open' AND best_source IS NOT NULL "
+               "AND best_score > 0 AND permuter_turns < ? AND COALESCE(best_kind, '') != 'data' "
+               "AND COALESCE(handoff, '') != 'human' AND id NOT IN (SELECT function_id FROM claims) "
+               "AND (COALESCE(handoff, '') = 'permuter' OR (n_insns <= ? AND (best_kind = 'regalloc' "
+               "     OR best_score <= n_insns * 100 * ?)))")
+        params: list = [proj["id"], PERMUTER_TURNS, max_insns, near]
+        if max_score:
+            sql += " AND best_score <= ?"
+            params.append(int(max_score))
+        sql += (" ORDER BY COALESCE(handoff, '') = 'permuter' DESC, COALESCE(best_kind, '') = 'regalloc' DESC, "
+                "permuter_turns ASC, CAST(best_score AS REAL) / (n_insns * 100) ASC, n_insns ASC LIMIT ?")
+        params.append(int(limit))
+        return self.store.all(sql, *params)
+
+    def permuter_done(self, agent: Agent, function_id: int, notes: str = "") -> None:
+        """A permuter run on a function ended (its claim, if any, goes; no "given up" is counted). After
+        PERMUTER_TURNS runs without a match it goes back to the agents: the strongest tiers take it from there."""
+        now = time.time()
+        with self.store.tx() as db:
+            db.execute("DELETE FROM claims WHERE function_id=? AND agent_id=?", (function_id, agent.id))
+            fn = db.execute("SELECT * FROM functions WHERE id=?", (function_id,)).fetchone()
+            if fn is None or fn["status"] == "matched":
+                return
+            turns = fn["permuter_turns"] + 1
+            db.execute("UPDATE functions SET permuter_turns=? WHERE id=?", (turns, function_id))
+            if turns >= PERMUTER_TURNS and fn["handoff"] == "permuter":
+                db.execute("UPDATE functions SET handoff=NULL, handoff_note=?, handoff_at=? WHERE id=?",
+                           (f"permuter: {turns} runs, best score {fn['best_score']}; back to the agents", now, function_id))
+            if notes.strip():
+                db.execute("INSERT INTO notes(project_id,function_id,agent_id,text,created_at) VALUES(?,?,?,?,?)",
+                           (fn["project_id"], function_id, agent.id, notes.strip(), now))
+            self._event(db, fn["project_id"], agent.id, "permuted", fn["name"])
+
+    def set_handoff(self, project: str | None, function: str, to: str | None, note: str = "") -> str:
+        """Leave a function for the permuter or a human (no automatic claims), or give it back (to=None)."""
         fn = self._function(function, project)
+        to = (to or "").strip().lower() or None
+        if to is not None and to not in LEAVE_FOR:
+            raise NetworkError(f"leave it for one of: {', '.join(LEAVE_FOR)}")
+        with self.store.tx() as db:
+            db.execute("UPDATE functions SET handoff=?, handoff_note=?, handoff_at=? WHERE id=?",
+                       (to, note.strip() or None, time.time(), fn["id"]))
+        return f"{fn['name']}: " + (f"left for the {to}" if to else "back in the queue for agents")
+
+    def release(self, agent: Agent, function: str, notes: str, project: str | None = None, leave_for: str = "") -> str:
+        """Give a function up. leave_for: "permuter" (only registers/order differ: no more agents on it until the
+        permuter has had its runs) or "human" (it can't match for a reason C can't fix, e.g. a tool problem).
+        Without it, a function whose best attempt differs only in registers/order, or whose note says so, goes to
+        the permuter anyway."""
+        fn = self._function(function, project)
+        leave_for = (leave_for or "").strip().lower()
+        if leave_for and leave_for not in LEAVE_FOR:
+            raise NetworkError(f"leave_for must be one of: {', '.join(LEAVE_FOR)} (or empty)")
+        why = notes.strip()
+        if not leave_for and (fn["best_score"] or 0) > 0 and fn["best_source"]:
+            if (fn["best_kind"] or "") == "regalloc":
+                leave_for, why = "permuter", "auto: the best attempt differs only in registers/order. " + why
+            elif re.search(r"\bregalloc(?:ation)?[- ]only\b|\bpermuter\b", notes, re.I):
+                leave_for = "permuter"
+        if leave_for == "permuter" and (not fn["best_source"] or fn["permuter_turns"] >= PERMUTER_TURNS):
+            leave_for = ""  # nothing for it to permute, or it already had its runs: stays with the agents
+        now = time.time()
         with self.store.tx() as db:
             row = db.execute("SELECT agent_id FROM claims WHERE function_id=?", (fn["id"],)).fetchone()
             if row is None or row["agent_id"] != agent.id:
                 raise NetworkError(f"you don't hold a claim on {fn['name']}")
             db.execute("DELETE FROM claims WHERE function_id=?", (fn["id"],))
             db.execute("UPDATE functions SET abandons=abandons+1 WHERE id=?", (fn["id"],))
+            if leave_for:
+                db.execute("UPDATE functions SET handoff=?, handoff_note=?, handoff_at=? WHERE id=?",
+                           (leave_for, f"{agent.name}: {why}"[:600], now, fn["id"]))
             if notes.strip():
                 db.execute("INSERT INTO notes(project_id,function_id,agent_id,text,created_at) VALUES(?,?,?,?,?)",
-                           (fn["project_id"], fn["id"], agent.id, notes.strip(), time.time()))
+                           (fn["project_id"], fn["id"], agent.id, notes.strip(), now))
             self._event(db, fn["project_id"], agent.id, "release", fn["name"])
+        left = {"permuter": " Left for the permuter: agents get it back only if the permuter can't match it.",
+                "human": " Left for a human: no agent gets it automatically until someone looks at it."}
         return (f"Released {fn['name']}. Your best attempt and notes are saved so the next agent starts "
-                f"where you left off. Call claim_function for a new one.")
+                f"where you left off.{left.get(leave_for, '')} Call claim_function for a new one.")
 
     def get_function(self, function: str, project: str | None = None, agent: Agent | None = None) -> str:
         return self._brief(self._function(function, project), agent, header="VIEW")
@@ -389,6 +592,15 @@ class Network:
                 else:
                     db.execute("UPDATE claims SET expires_at=? WHERE function_id=?", (now + self.claim_ttl, fn["id"]))
 
+        t = tiers.get(self.tier_of(agent))
+        if t is not None and t.hard_stop and not scratch:
+            since, after = self._stall(fn["id"], agent.id, t)
+            if since >= 2 * after:
+                raise NetworkError(
+                    f"{since} compiles of {fn['name']} without beating your best: stop here. release_function with "
+                    "notes (what you tried, what's left; leave_for=\"permuter\" if only registers or order differ), "
+                    "then claim_function for the next one.")
+
         ctx = self._context(proj["id"], fn["unit"])
         result = self._compile(proj, ctx["header"], source)
 
@@ -415,6 +627,11 @@ class Network:
             d = scoring.DiffResult(0 if verdict else max(1, d.score), d.max_score, d.rows, verdict)
         matched_now = d.bytes_match and not scratch
         self._record(fn, agent, d.score, source, ctx["version"], matched=matched_now)
+        kind = tiers.diff_kind(d, verdict)
+        if kind and not scratch:  # what the best attempt's diff says is left (the permuter's queue reads this)
+            with self.store.tx() as db:
+                db.execute("UPDATE functions SET best_kind=? WHERE id=? AND best_score=? AND best_source=?",
+                           (kind, fn["id"], d.score, source))
 
         if scratch:
             head = f"(scratch — {fn['name']} was already matched) score {d.score}"
@@ -430,6 +647,12 @@ class Network:
                 head += ("\nNOT A MATCH YET: every instruction reads the same, but the bytes differ"
                          + (" because of the linking notes at the end: fix those." if problems else
                             ": an encoding the listing doesn't show (branch form, an immediate, a relocation)."))
+                head += ("\nA switch's case values come only from its jump table: read_data the jtbl_ address and "
+                         "label each case by where its entry points. If your data is right and it still differs, it "
+                         "may be a tool problem: release_function with leave_for=\"human\" and say what you checked.")
+            elif kind == "regalloc":
+                head += ("\nOnly registers, instruction order or stack offsets differ: the permuter's job. Unless you "
+                         "see a concrete fix, release_function with leave_for=\"permuter\" and claim the next one.")
         warn = f"\ncompiler output:\n{result.log.strip()}" if result.log.strip() else ""
         if problems:
             warn += "\nwhen linking your code at the function's address:\n" + "\n".join(f"- {p}" for p in problems)
@@ -440,11 +663,25 @@ class Network:
         mostly do in the first few tries, and the agent's time is better spent on the next one. Big functions get
         longer (a quarter of Mario Party 6's agent matches over 64 instructions took more than 4 compiles, and
         those functions hold most of the code left)."""
+        since, after = self._stall(function_id, agent_id, tiers.get(self.tier_of(agent_id)), after)
+        if since < after:
+            return ""
+        return (f"\n\n⏭ No better in your last {since} compiles. release_function with notes (what you tried, what's "
+                "left) and claim the next one: functions that match mostly do in the first few tries, and this one "
+                "keeps your best attempt for whoever comes next.")
+
+    def _stall(self, function_id: int, agent_id: int, tier: tiers.Tier | None = None,
+               after: int | None = None) -> tuple[int, int]:
+        """(compiles since this agent's last better score on the function, compiles before the nudge to move on).
+        The nudge comes later for bigger functions, and by tier: sooner for local models, later for large ones."""
         if after is None:
             row = self.store.one("SELECT n_insns FROM functions WHERE id=?", function_id)
             n = (row["n_insns"] if row else 0) or 0
             after = 4 if n < 64 else 6 if n < 128 else 8 if n < 256 else 10
-        rows = self.store.all("SELECT score FROM attempts WHERE function_id=? AND agent_id=? ORDER BY id DESC LIMIT 16",
+            if tier is not None:
+                after = max(3, after + tier.stall_bonus)
+        # the last 32 compiles: enough to see twice the longest nudge (the hard stop for the cheaper tiers)
+        rows = self.store.all("SELECT score FROM attempts WHERE function_id=? AND agent_id=? ORDER BY id DESC LIMIT 32",
                               function_id, agent_id)
         best, since = None, 0
         for r in reversed(rows):
@@ -452,11 +689,7 @@ class Network:
                 best, since = r["score"], 0
             else:
                 since += 1
-        if since < after:
-            return ""
-        return (f"\n\n⏭ No better in your last {since} compiles. release_function with notes (what you tried, what's "
-                "left) and claim the next one: functions that match mostly do in the first few tries, and this one "
-                "keeps your best attempt for whoever comes next.")
+        return since, after
 
     def _record(self, fn, agent: Agent, score: int | None, source: str, ctx_version: int, matched: bool = False,
                 compiled: bool | None = None, via: str = "agent"):

@@ -26,6 +26,7 @@ from pathlib import Path
 
 import httpx
 
+from .. import tiers
 from . import tools
 from .engine import RomNetwork
 
@@ -83,6 +84,11 @@ ALIASES = {"gemini": "antigravity", "agy": "antigravity"}
 # reach one through agy's generic MCP dispatcher instead, a headless run can't ask, and agy quietly refuses it:
 # this rule in the user's agy settings allows decomp.wtf's tools (and nothing else).
 AGY_ALLOW = "mcp(decomp/*)"
+
+# The tools a local model gets (tiers.py "local"): the loop itself plus what it needs to read data and ask for
+# help. Every definition costs a slow local model prompt-reading time, and fewer choices keep it on track.
+LOCAL_TOOLS = {"claim_function", "compile_and_diff", "release_function", "get_context", "read_data", "find_similar",
+               "add_note", "get_function"}
 
 # Functions per helper session: a fresh session starts with a small, clean context (each function's assembly,
 # drafts and diffs would otherwise ride along into the next one): cheaper per call, and the model stays sharp.
@@ -666,6 +672,8 @@ class Manager:
     def _run(self, s: Session) -> None:
         agent, token = self.net.local_agent(s.agent_name)
         self.assignments[agent.id] = s.slug
+        tier = tiers.detect(s.kind, s.options, is_local)
+        self.net.set_agent_tier(agent.id, tier)  # what it's handed (tiers.py); None: everything, as before
         workdir = self.home / "agents" / s.id
         workdir.mkdir(parents=True, exist_ok=True)
         failures = throttles = 0
@@ -681,6 +689,12 @@ class Manager:
         while not s.stop.is_set():
             if self._left(s.slug) == 0:
                 s.push("info", "nothing left to decompile here 🎉")
+                break
+            if tier is not None and self.net.left_for(agent, s.slug) == 0:
+                # everything open is too big or too hard for this model, or waits for the permuter: stop rather than
+                # burn compiles on it
+                s.push("info", f"nothing left that suits a {tier} model ({self._left(s.slug)} functions are open: "
+                               "they need a stronger model or the permuter). Stopping this helper.")
                 break
             if (cap := self.over_budget(s.slug)) is not None:
                 s.push("info", f"stopping: the agents on this project have spent the ${cap:.2f} budget (Setup)")
@@ -766,18 +780,27 @@ class Manager:
                      f"add_note and no function):\n{learned}\n")
         if (wish := self.net.instructions(s.slug)):
             text += f"\nThe user's instructions for this project (they come first):\n{wish}\n"
+        if (t := tiers.get(tiers.detect(s.kind, s.options, is_local))) is not None:
+            text += f"\nYour role here ({t.name} model; claim_function picks functions that suit it):\n{t.guidance}\n"
         return text
+
+    def _per_session(self, s: Session) -> int:
+        """Claims per session: the helper's own setting, else its tier's (a local model: one), else the default."""
+        if s.options.get("per_session"):
+            return int(s.options["per_session"])
+        t = tiers.get(tiers.detect(s.kind, s.options, is_local))
+        return t.per_session if t is not None else PER_SESSION
 
     def _prompt(self, s: Session) -> str:
         ov = self.net.overview(s.slug)
         if ov.get("kind") == "fork":
             guides = ["fork", "objdiff", *tools.PLATFORM_GUIDES.get(ov.get("platform") or "", [])]
             return tools.FORK_PROMPT.format(title=ov["title"], platform=ov.get("platform_name") or "its platform",
-                                            count=s.options.get("per_session", PER_SESSION),
+                                            count=self._per_session(s),
                                             guides=", ".join(f'guide("{g}")' for g in guides))
         guide = {"psx": "psx", "ps2": "ps2", "gba": "agbcc"}.get(ov.get("platform")) or (
             "ido" if ov["compiler"]["toolchain"].startswith("ido") else "gcc-kmc")
-        return tools.WORK_PROMPT.format(title=ov["title"], count=s.options.get("per_session", PER_SESSION), compiler_guide=guide)
+        return tools.WORK_PROMPT.format(title=ov["title"], count=self._per_session(s), compiler_guide=guide)
 
     def _command(self, s: Session, token: str, workdir: Path) -> tuple[list[str], dict, str]:
         """The agent's command line, environment and what goes in on stdin (the prompt)."""
@@ -935,6 +958,8 @@ class Manager:
         if s.options.get("api_key"):
             headers["Authorization"] = f"Bearer {s.options['api_key']}"
         schema = api_tool_schemas(fork=bool(self.net.fork_slug(s.slug)))
+        if tiers.detect(s.kind, s.options, is_local) == "local":  # a small model stays on track with fewer tools
+            schema = [t for t in schema if t["function"]["name"] in LOCAL_TOOLS] or schema
         messages = [{"role": "system", "content": tools.INSTRUCTIONS},
                     {"role": "user", "content": self.prompt(s)}]
         used_tool = False
@@ -1055,8 +1080,10 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
         "compile_and_diff": ("Compile C for the function, link it at its address and diff against the ROM. "
                              "Score 0 = matched. Several functions: names comma-separated, all definitions in source.",
                              s(function=st("function name, or several: a, b, c", True), source=st("C source", True))),
-        "release_function": ("Give up a function with notes for the next agent.",
-                             s(function=st("function", True), notes=st("what you tried, what is left", True))),
+        "release_function": ("Give up a function with notes for the next agent. leave_for=permuter when only registers "
+                             "or instruction order differ; leave_for=human when it can't match for a reason C can't fix.",
+                             s(function=st("function", True), notes=st("what you tried, what is left", True),
+                               leave_for=st("permuter | human (optional)"))),
         "get_context": ("The shared header included in every compile.", s()),
         "edit_context": ("Replace `old` (exactly once) with `new` in the shared header, or append when old is empty.",
                          s(old=st("text to replace, or empty", True), new=st("replacement", True),
@@ -1067,7 +1094,8 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
                            s(function=st("function", True), at=st("address like 0x80001234", True), new_name=st("name"))),
         "read_data": ("Hex dump of the original's data at an address or symbol.", s(what=st("address or symbol", True),
                                                                                     length=it("bytes, up to 512"))),
-        "list_functions": ("List functions by status.", s(status=st("open | matched | all"), limit=it("max rows"))),
+        "list_functions": ("List functions by status.", s(status=st("open | matched | all | permuter | human"),
+                                                          limit=it("max rows"))),
         "add_note": ("Leave a note for other agents.", s(text=st("note", True), function=st("function"))),
         "search_notes": ("Search notes.", s(query=st("text", True))),
         "find_similar": ("Functions that look like this one, matched ones first, with the best one's source.",
