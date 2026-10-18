@@ -758,7 +758,7 @@ function renderStats(ov) {
       + `(${bytes(ov.asm_bytes)} set aside: ${bytes(ov.sdk_bytes || 0)} Sony SDK, ${bytes(ov.asm_bytes - (ov.sdk_bytes || 0))} assembly)` : "")
     + linkedText(ov) + (S.today ? ` · ${S.today} matched today` : "");
   // the average function's completeness (its best attempt, matched ones as 100%): shows work that's nearly there
-  $("lgAsm").hidden = !(ov.asm_bytes && counts > 0);
+  $("lgAsm").hidden = !(ov.asm_bytes - (ov.sdk_bytes || 0) > 0);
   $("lgSdk").hidden = !(ov.sdk_bytes && counts > 0);
   const avg = ov.avg_complete, avgw = ov.avg_complete_w;  // the second one weighs big functions more
   $("pctSub2").hidden = avg == null;
@@ -1291,7 +1291,7 @@ function cssColor(name) {
   return rgb;
 }
 function readColors() {
-  colors = { open: cssColor("--open"), tried: cssColor("--tried"), work: cssColor("--work"), match: cssColor("--match"), hi: cssColor("--match-hi"), ink: cssColor("--ink"), sdk: cssColor("--sdk") };
+  colors = { open: cssColor("--open"), tried: cssColor("--tried"), work: cssColor("--work"), match: cssColor("--match"), hi: cssColor("--match-hi"), ink: cssColor("--ink"), sdk: cssColor("--sdk"), asm: cssColor("--asm") };
 }
 const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
 const rgb = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
@@ -1340,7 +1340,7 @@ function applyAttempts(attempts) {
 function cellColor(f) {
   if (f.status === "matched") return [colors.match, 1];
   if (f.status === "asm" && f.sdk) return [colors.sdk, 0.9];  // unmodified Sony SDK code: not decompiled
-  if (f.status === "asm") return [colors.tried, 0.35];
+  if (f.status === "asm") return [colors.asm, 0.9];  // hand-written assembly: no C compiles to it
   if (f.best != null) return [mix(colors.tried, colors.hi, Math.pow(pctOf(f.best, f.insns) || 0, 3)), 1];
   return [colors.open, 1];
 }
@@ -2113,7 +2113,7 @@ function renderList() {
     const best = st === "matched" ? `<span class="ok">100%</span>` : p == null ? `<span class="dim">–</span>` : pctText(p);
     const tries = f.attempts ? ` title="${f.attempts} compile${f.attempts === 1 ? "" : "s"}${f.best != null ? ` · best score ${f.best}` : ""
       }${f.matched_by ? ` · matched by ${esc(f.matched_by)} ${clock(f.matched_at)}` : ""}${f.agent ? ` · ${esc(f.agent)} holds the claim now` : ""}"` : "";
-    const status = st === "matched" ? `<span class="st matched" title="${esc(f.matched_by ? "by " + f.matched_by : "")}">matched</span>` : st === "asm" ? (f.sdk ? `<span class="st sdk" title="${esc(f.sdk)}: unmodified Sony SDK code, replaced by a port, not decompiled">Sony SDK</span>` : `<span class="st" title="hand-written assembly: no C compiles to it">assembly</span>`) : st === "working" ? `<span class="st working">${esc(f.agent || "working")}</span>`
+    const status = st === "matched" ? `<span class="st matched" title="${esc(f.matched_by ? "by " + f.matched_by : "")}">matched</span>` : st === "asm" ? (f.sdk ? `<span class="st sdk" title="${esc(f.sdk)}: unmodified Sony SDK code, replaced by a port, not decompiled">Sony SDK</span>` : `<span class="st asm" title="hand-written assembly: no C compiles to it">assembly</span>`) : st === "working" ? `<span class="st working">${esc(f.agent || "working")}</span>`
       : st === "tried" ? `<span class="st tried">tried</span>` : `<span class="st">to do</span>`;
     return `<tr data-fn="${esc(f.name)}" class="${S.fn === f.name ? "sel" : ""}" tabindex="0"><td class="mono dim">${fork ? esc(f.unit || "") : hex8(f.vram)}</td>
       <td class="mono name">${(S.ov && (S.ov.priority || []).includes(f.name)) ? `<span class="star" title="agents take it next">★</span>` : ""}${esc(f.name)}</td><td class="r mono">${f.insns.toLocaleString()}</td><td class="r mono">${best}</td>

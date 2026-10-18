@@ -8,7 +8,7 @@
   --line: #d8d4c8; --line-soft: #e4e0d5;
   --match: #157a49; --match-ink: #0f5d38; --match-bg: #d4eadb; --match-hi: #8fd3a8;
   --work: #a8670d; --work-bg: #f4e3c4; --miss: #b02a2f; --miss-bg: #f5d9d9;
-  --open: #d9d5c9; --tried: #c9c1a6; --sdk: #c2412d;
+  --open: #d9d5c9; --tried: #c9c1a6; --sdk: #c2412d; --asm: #7a52b3;
   --move: #2f5fb8; --move-bg: #dce5f5;
   --code-bg: #f7f5ef;
   --btn-ink: #f4f2ec;
@@ -27,7 +27,7 @@
     --line: #2a2924; --line-soft: #1f1e1a;
     --match: #4fcf8c; --match-ink: #86e3b0; --match-bg: #11301f; --match-hi: #23774a;
     --work: #e5b04b; --work-bg: #33260e; --miss: #f07b7e; --miss-bg: #361718;
-    --open: #272622; --tried: #4a4433; --sdk: #e5654f;
+    --open: #272622; --tried: #4a4433; --sdk: #e5654f; --asm: #a685e0;
     --move: #8fb0f0; --move-bg: #172238;
     --code-bg: #0f0f0d; --btn-ink: #0d0d0b;
     --shadow: 0 1px 0 var(--line-soft), 0 30px 60px -40px rgba(0, 0, 0, .9);
@@ -41,7 +41,7 @@
   --line: #2a2924; --line-soft: #1f1e1a;
   --match: #4fcf8c; --match-ink: #86e3b0; --match-bg: #11301f; --match-hi: #23774a;
   --work: #e5b04b; --work-bg: #33260e; --miss: #f07b7e; --miss-bg: #361718;
-  --open: #272622; --tried: #4a4433; --sdk: #e5654f;
+  --open: #272622; --tried: #4a4433; --sdk: #e5654f; --asm: #a685e0;
   --move: #8fb0f0; --move-bg: #172238;
   --code-bg: #0f0f0d; --btn-ink: #0d0d0b;
   --shadow: 0 1px 0 var(--line-soft), 0 30px 60px -40px rgba(0, 0, 0, .9);
@@ -327,7 +327,7 @@ a.ghost, a.primary { text-decoration: none; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .sw { width: 10px; height: 10px; border-radius: 2.5px; display: inline-block; }
-.sw.open { background: var(--open); } .sw.tried { background: var(--tried); } .sw.work { background: var(--work); } .sw.match { background: var(--match); } .sw.sdk { background: var(--sdk); }
+.sw.open { background: var(--open); } .sw.tried { background: var(--tried); } .sw.work { background: var(--work); } .sw.match { background: var(--match); } .sw.sdk { background: var(--sdk); } .sw.asm { background: var(--asm); }
 .map-hint { padding: 12px 16px 0; }
 .map-wrap { position: relative; padding: 12px 16px 16px; }
 #map { display: block; width: 100%; cursor: crosshair; }
@@ -383,6 +383,7 @@ a.ghost, a.primary { text-decoration: none; }
 .fn-table tr.none td { color: var(--muted); text-align: center; padding: 28px; cursor: default; }
 .st { font: 500 11px/1 var(--mono); padding: 4px 7px; border-radius: 999px; color: var(--muted); border: 1px solid var(--line); }
 .st.sdk { color: var(--sdk); }
+.st.asm { color: var(--asm); }
 .st.matched { background: var(--match-bg); color: var(--match-ink); border-color: transparent; }
 .st.working { background: var(--work-bg); color: var(--work); border-color: transparent; }
 .st.tried { color: var(--ink-2); }
