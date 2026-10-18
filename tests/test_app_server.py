@@ -151,6 +151,40 @@ def test_an_agent_out_of_credit_stops_and_says_so(tmp_path, monkeypatch):
     assert manager._run_cli(s, "token", tmp_path) is False and s.throttled
 
 
+def test_a_usage_limit_waits_out_its_reset(tmp_path, monkeypatch):
+    """Claude Code stops at the plan's session limit ("5-hour limit reached · resets 5:00pm"): not a failure —
+    the session records how long the limit said it lasts, so the runner waits for the reset, then continues."""
+    manager = agents.Manager(None, tmp_path, "http://127.0.0.1:9/mcp")
+    s = agents.Session("claude-1", "claude", "Claude Code #1", "game", "claude-1", {})
+
+    def says(text: str) -> None:
+        code = f"print({text!r}); raise SystemExit(1)"
+        monkeypatch.setattr(manager, "_command", lambda s, token, workdir: ([sys.executable, "-c", code], dict(os.environ), ""))
+
+    says(json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                     "result": "5-hour limit reached ∙ resets 5:00pm (America/New_York)"}))
+    assert manager._run_cli(s, "token", tmp_path) is False and s.throttled
+    assert 60 < s.throttle_wait <= 12 * 3600 + 60
+    says("You've hit your weekly limit. Try again in 47m")
+    assert manager._run_cli(s, "token", tmp_path) is False and s.throttle_wait == 47 * 60
+    says("AI_APICallError: Too many requests. Your current concurrency is 5")
+    assert manager._run_cli(s, "token", tmp_path) is False and s.throttled and s.throttle_wait == 0
+
+
+def test_throttle_wait_parses_when_a_limit_lifts():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = time.mktime((2026, 10, 17, 15, 0, 0, 0, 0, -1))
+    assert agents.throttle_wait("5-hour limit reached · resets 5:00pm", now) == 2 * 3600 + 60
+    assert agents.throttle_wait("You've hit your 5-hour limit. Try again in 47m", now) == 47 * 60
+    assert agents.throttle_wait("Insufficient Balance", now) == 0
+    assert agents.throttle_wait("Too many requests", now) == 0
+    assert agents.throttle_wait("Weekly limit reached · resets on Sunday", now) == 60  # announced, not when
+    utc = datetime(2026, 10, 17, 12, 0, tzinfo=ZoneInfo("UTC")).timestamp()
+    assert agents.throttle_wait("Your limit will reset at 5:00pm (America/New_York)", utc) == 9 * 3600 + 60
+    assert agents.throttle_wait("5-hour limit reached · resets 17:00 (Europe/Berlin)", utc) == 3 * 3600 + 60  # 12:00 UTC is 14:00 there (DST)
+
+
 @needs_demo
 def test_builtin_api_agent_out_of_credit(app, monkeypatch):
     client, net, manager = app

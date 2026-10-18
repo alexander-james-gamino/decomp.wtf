@@ -106,3 +106,35 @@ takes it. A permuter run no longer counts as an agent giving up (`abandons`).
 - **UI controls** for tiers and handoffs.
 - **`best_kind` for old attempts.** Existing best attempts have none until they're compiled again; a rescore fills
   it in.
+
+---
+
+## 3. Session-limit auto-resume, and smaller UI things (2026-10-17, later)
+
+- **Session limit** (`agents.py`): a helper stopped by the account's plan cap ("5-hour limit reached · resets
+  5:00pm") now waits out the reset instead of dying after three tries. `throttle_wait()` parses the reset time
+  (wall clock with its IANA zone, or "try again in 47m"; 12 h cap), and the throttled branch waits that long.
+  Plain 429s keep the old 60-second retry.
+- **Hover info per attempt** (`app.js`): the diff view's "Latest attempt / Best" buttons show who·when·score on
+  hover; the functions table shows each function's compile count with its best score, matcher and claim; the
+  "now working" cards list the last compiles under the tries line. The per-compile chart already had its own
+  tooltips.
+- **Long text can't bleed out of its box** (`app.css`): notes, diff problems, the try message and job cards now
+  have `overflow-wrap: anywhere` (long URLs/addresses in a note can no longer push text across the layout).
+- **The notes can no longer cover the assembly and C panes** (`app.css`): in the function drawer, Chrome sizes
+  the `auto` grid rows of `.drawer-body` against the card's fixed height, so the row with the 58vh-tall
+  assembly/C panes was squeezed to ~314px and the panes painted over the rows below (xref, notes). Grid rows
+  are now `max-content`, so the drawer body scrolls instead of the rows compressing; reproduced and verified
+  with headless Chromium against the running app (notes at y 862 below panes at 713, no intersection).
+- **Average completeness** (`engine.py` + `app.js`/`index.html`): under "150.9 KB of 620.6 KB · 91 matched today"
+  a second gray line now reads "the average function is 87.5% there · 61.9% weighted (by instructions)" — the mean
+  best-attempt completeness over all functions (matched = 100%, hand-written assembly = 100%, untried = 0%). The
+  plain mean weighs every function once; the weighted mean weighs each by its instructions, so it shifts toward
+  the big (usually hardest) functions and sits far below the plain one when small functions are near-matched but
+  big ones are barely attempted. Also visible: it drags toward the byte-exact % as (nearly-)complete attempts
+  become full matches.
+- **Model tiers off by default, with a GUI toggle** (`agents.py`, `server.py`, settings page): the tier routing
+  (cheap models get small functions, strong models the hard ones) is now disabled unless the user turns on
+  **Model tiers** in Settings. Off: every helper can claim anything (the size-based move-on nudge stays).
+  A helper only learns its tier when it starts while the toggle is on; switching it off clears the stored
+  tiers of helpers already working.

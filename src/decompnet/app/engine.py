@@ -1313,9 +1313,19 @@ class RomNetwork(Network):
         if (fork := self.fork_slug(slug)):
             return self.forks.overview(fork)
         cfg = self.cfg(proj)
+        # every function weighs the same in `avg_complete`; `avg_complete_w` weighs each by its instructions,
+        # i.e. of all instructions in the project, the share the best attempt of each gets right
         agg = self.store.one(
             "SELECT COUNT(*) AS total, SUM(status='matched') AS matched, SUM(size) AS bytes, "
-            "SUM(CASE WHEN status='matched' THEN size ELSE 0 END) AS matched_bytes, SUM(attempts) AS attempts "
+            "SUM(CASE WHEN status='matched' THEN size ELSE 0 END) AS matched_bytes, SUM(attempts) AS attempts, "
+            "SUM(CASE WHEN status='asm' THEN size ELSE 0 END) AS asm_bytes, "
+            "SUM(CASE WHEN status='asm' AND meta LIKE '%\"sdk\"%' THEN size ELSE 0 END) AS sdk_bytes, "
+            "COALESCE(AVG(CASE WHEN status='matched' OR status='asm' THEN 1.0 "  # hand-written assembly: as done as it gets
+            "WHEN best_score IS NOT NULL AND n_insns > 0 THEN MAX(0, n_insns * 100 - best_score) / (n_insns * 100.0) "
+            "ELSE 0.0 END), 0.0) AS avg_complete, "
+            "100.0 * COALESCE(SUM(CASE WHEN status='matched' OR status='asm' THEN n_insns "
+            "WHEN best_score IS NOT NULL THEN MAX(0, n_insns * 100 - best_score) / 100.0 "
+            "ELSE 0 END), 0.0) / NULLIF(SUM(COALESCE(n_insns, 0)), 0) AS avg_complete_w "
             "FROM functions WHERE project_id=?", proj["id"])
         tc = toolchains.get(cfg["compiler"]["toolchain"])
         return {
@@ -1329,6 +1339,9 @@ class RomNetwork(Network):
                          "why": None if tc.supported else toolchains.unsupported_cpu()},
             "functions": agg["total"] or 0, "matched": agg["matched"] or 0, "bytes": agg["bytes"] or 0,
             "matched_bytes": agg["matched_bytes"] or 0, "attempts": agg["attempts"] or 0,
+            "asm_bytes": agg["asm_bytes"] or 0, "sdk_bytes": agg["sdk_bytes"] or 0,
+            "avg_complete": round(100 * (agg["avg_complete"] or 0.0), 2),
+            "avg_complete_w": round(agg["avg_complete_w"], 2) if agg["avg_complete_w"] is not None else None,
             "context_version": self._context(proj["id"])["version"],
             "folder": proj["root"],
             "export": cfg.get("export"),
@@ -1348,7 +1361,7 @@ class RomNetwork(Network):
     def function_map(self, slug: str) -> list[dict]:
         proj = self._project(slug)
         rows = self.store.all(
-            "SELECT f.name, f.vram, f.size, f.n_insns, f.status, f.best_score, f.attempts, f.unit, f.matched_at, "
+            "SELECT f.name, f.vram, f.size, f.n_insns, f.status, f.best_score, f.attempts, f.unit, f.matched_at, f.meta, "
             "a.name AS agent, m.name AS matched_by FROM functions f LEFT JOIN claims c ON c.function_id=f.id "
             "LEFT JOIN agents a ON a.id=c.agent_id LEFT JOIN agents m ON m.id=f.matched_agent_id "
             "WHERE f.project_id=? ORDER BY f.vram, f.unit, f.id", proj["id"])
@@ -1359,7 +1372,10 @@ class RomNetwork(Network):
         return [{"name": r["name"], "vram": r["vram"], "size": r["size"], "insns": r["n_insns"], "unit": r["unit"],
                  "status": r["status"] if r["status"] in ("matched", "asm") else "working" if (r["agent"] or key(r) in remote) else "open",
                  "best": r["best_score"], "attempts": r["attempts"], "agent": r["agent"] or remote.get(key(r)),
-                 "matched_at": r["matched_at"], "matched_by": r["matched_by"]} for r in rows]
+                 "matched_at": r["matched_at"], "matched_by": r["matched_by"],
+                 # set aside as unmodified Sony SDK code (tools/mark_sdk.py): its SDK name, drawn apart on the map
+                 "sdk": (json.loads(r["meta"]).get("sdk") if r["meta"] and '"sdk"' in r["meta"] else None)}
+                for r in rows]
 
     def map_signature(self, slug: str) -> str:
         """What the function map shows, summed up: it changes when a function is added, matched, tried or claimed.
