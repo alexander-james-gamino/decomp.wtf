@@ -1035,7 +1035,8 @@ class RomNetwork(Network):
             rows = db.execute(
                 "SELECT f.* FROM functions f WHERE f.project_id=? AND f.status='open' AND f.boost >= 0 AND f.n_insns <= ? "
                 "AND f.abandons = 0 AND f.unit=? AND f.id NOT IN (SELECT function_id FROM claims) "
-                "AND f.handoff IS NULL AND NOT (COALESCE(f.best_kind, '') = 'regalloc' AND f.best_score > 0) "
+                + ("AND f.handoff IS NULL AND NOT (COALESCE(f.best_kind, '') = 'regalloc' AND f.best_score > 0) "
+                   if self.routing_on() else "") +
                 "ORDER BY ABS(COALESCE(f.vram, 0) - ?), f.id LIMIT ?",
                 (proj["id"], biggest, first["unit"], first["vram"] or 0, n)).fetchall()
             for r in rows:
@@ -1443,9 +1444,10 @@ class RomNetwork(Network):
                 # the same rules as every automatic claim: not one this agent gave up on lately, nor one anybody released
                 # within the cooldown (else the queue hands the same stuck function back again and again), nor one
                 # left for the permuter or a human, and only what suits the agent's model
-                if self.store.one("SELECT 1 FROM events WHERE project_id=? AND kind='release' AND detail=? "
-                                  "AND ((agent_id=? AND created_at > ?) OR created_at > ?)", proj["id"], name, agent.id,
-                                  now - network.RELEASE_RETRY, now - network.RELEASE_COOLDOWN):
+                if self.routing_on() and self.store.one(
+                        "SELECT 1 FROM events WHERE project_id=? AND kind='release' AND detail=? "
+                        "AND ((agent_id=? AND created_at > ?) OR created_at > ?)", proj["id"], name, agent.id,
+                        now - network.RELEASE_RETRY, now - network.RELEASE_COOLDOWN):
                     continue
                 if not self.fits(agent, row):
                     continue

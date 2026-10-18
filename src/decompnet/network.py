@@ -87,6 +87,9 @@ def _ago(ts: float | None) -> str:
 class Network:
     def __init__(self, db_path: str | Path, claim_ttl: int = CLAIM_TTL):
         self.store = Store(db_path)
+        # Model tiers / routing (the GUI's "Model tiers" setting; the app sets this). Off: every agent may be handed
+        # any open function that isn't claimed (permuter handoffs too), its own recent releases last, not blocked.
+        self.routing_on = lambda: True
         self.claim_ttl = claim_ttl
         self._pool = ThreadPoolExecutor(max_workers=8)
 
@@ -338,6 +341,14 @@ class Network:
         permuter (the cheaper tiers never take them), and a tier above one that's working takes what that one
         can't (the ORDER BY prefix). relax: the size and give-up caps dropped (no stronger tier is around)."""
         t = tiers.get(self.tier_of(agent))
+        if t is None and not self.routing_on():
+            # routing off: anything open and unclaimed; what this agent released lately comes after everything else
+            # last of all: what an agent left for a human, then what this agent released lately; nothing is blocked
+            later = ("COALESCE(f.handoff, '') = 'human', "
+                     f"f.name IN (SELECT detail FROM events WHERE project_id={int(proj['id'])} AND agent_id={int(agent.id)} "
+                     f"AND kind='release' AND created_at > {float(now - RELEASE_RETRY)}), ")
+            return ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims)",
+                    [proj["id"]], later)
         where = ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims) "
                  "AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release' "
                  "AND created_at > ?) AND f.handoff IS NULL")

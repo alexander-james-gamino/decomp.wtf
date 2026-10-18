@@ -265,6 +265,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
     settings = Settings(home / "settings.json")
     manager.budget = lambda: float(settings.data.get("budget_usd") or 0)
     manager.tiers_on = lambda: bool(settings.data.get("model_tiers", False))
+    net.routing_on = manager.tiers_on  # off: no tiers, no handoff or release blocks in the claim queue
 
     def remember(running: list[dict]) -> None:
         settings.data["running_agents"] = running
