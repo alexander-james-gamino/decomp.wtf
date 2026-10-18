@@ -26,6 +26,10 @@ CLAIM_TTL = 30 * 60
 # A function an agent just released goes to the back of the queue for this long, for every agent: the next one
 # starts on something fresh instead of passing the same function back and forth. Asked for by name, it comes at once.
 RELEASE_COOLDOWN = 15 * 60
+# A function an agent released isn't handed back to that agent for this long (not forever: helpers keep one identity
+# for days, and once they had released everything left, they got "nothing left to claim" while 175 functions were
+# open). By then the shared header and the notes have usually moved on; asked for by name, it comes at once.
+RELEASE_RETRY = 12 * 3600
 MACHINE_AGENTS = ("autopilot", "permuter")  # decomp.wtf's own workers: their claims never mean "given up on"
 # Twins first (see app/twins.py): a function whose code the game has more than once (boost: how many more times)
 # and isn't too big or given up on, best value per instruction first; its twins (boost -1) last, as they match for
@@ -328,15 +332,16 @@ class Network:
     def _eligible(self, db, agent: Agent, proj, now: float, relax: bool = False) -> tuple[str, list, str]:
         """(WHERE clause, its parameters, ORDER BY prefix) for what this agent may be handed automatically.
 
-        Everyone: open, unclaimed, not given up on by this agent, not left for the permuter or a human.
+        Everyone: open, unclaimed, not given up on by this agent lately (RELEASE_RETRY), not left for the
+        permuter or a human.
         By tier: what fits it (size, how often others gave up), register-allocation near misses wait for the
         permuter (the cheaper tiers never take them), and a tier above one that's working takes what that one
         can't (the ORDER BY prefix). relax: the size and give-up caps dropped (no stronger tier is around)."""
         t = tiers.get(self.tier_of(agent))
         where = ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims) "
-                 "AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release') "
-                 "AND f.handoff IS NULL")
-        params: list = [proj["id"], proj["id"], agent.id]
+                 "AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release' "
+                 "AND created_at > ?) AND f.handoff IS NULL")
+        params: list = [proj["id"], proj["id"], agent.id, now - RELEASE_RETRY]
         prefix = ""
         if t is None:
             return where, params, prefix
