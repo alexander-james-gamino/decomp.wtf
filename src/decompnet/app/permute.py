@@ -66,6 +66,7 @@ class Permuter:
     def __init__(self, net):
         self.net = net
         self.jobs: dict[str, State] = {}
+        self.remotes: dict[str, dict[str, State]] = {}  # slug -> SSH host -> a worker permuting on that machine
         self._turns: dict[int, int] = {}  # function id -> turns spent on it
 
     def external_cmd(self, slug: str) -> list[str] | None:
@@ -87,14 +88,27 @@ class Permuter:
     def status(self, slug: str) -> dict | None:
         st = self.jobs.get(slug)
         if st is None:
-            return {"state": None, "mode": EXTERNAL, "available": True} if self.external_cmd(slug) else None
+            return ({"state": None, "mode": EXTERNAL, "available": True, "remotes": self._remote_status(slug)}
+                    if self.external_cmd(slug) else None)
         out = {k: v for k, v in st.__dict__.items() if k not in ("stop", "proc")}
         out["available"] = st.mode == EXTERNAL or self.external_cmd(slug) is not None
-        return out
+        return out | {"remotes": self._remote_status(slug)}
+
+    def _remote_status(self, slug: str) -> list[dict]:
+        return [{"host": h, **{k: v for k, v in st.__dict__.items() if k not in ("stop", "proc")},
+                 "log": st.log[-3:]} for h, st in sorted(self.remotes.get(slug, {}).items())]
 
     def start(self, slug: str, options: dict | None = None, manual: bool = False) -> State | None:
         """Run on the project's near misses until there are none (looking again every few minutes while the
-        app runs: agents make new ones). A project's own worker runs only when asked for (manual)."""
+        app runs: agents make new ones). A project's own worker runs only when asked for (manual).
+        options["remote"]: an SSH host: that worker runs its permuter there (see tools/permute/REMOTE_PERMUTER.md)."""
+        host = re.sub(r"[^\w.@-]", "", str((options or {}).get("remote") or ""))
+        if host:
+            cur = self.remotes.get(slug, {}).get(host)
+            if cur is not None and cur.state == "running":
+                return cur
+            cmd = self.external_cmd(slug)
+            return self._start_external(slug, cmd, options or {}, host) if cmd and manual else None
         if (st := self.jobs.get(slug)) is not None and st.state == "running":
             return st
         if slug in self.net.links:  # a room member: the host's copy permutes, and its matches come back here
@@ -105,8 +119,9 @@ class Permuter:
         threading.Thread(target=self._loop, args=(slug, st), daemon=True, name=f"permuter-{slug}").start()
         return st
 
-    def stop(self, slug: str) -> None:
-        if (st := self.jobs.get(slug)) is not None:
+    def stop(self, slug: str, remote: str = "") -> None:
+        st = self.remotes.get(slug, {}).get(remote) if remote else self.jobs.get(slug)
+        if st is not None:
             st.stop.set()
             if st.proc is not None and st.proc.poll() is None:
                 try:
@@ -116,7 +131,7 @@ class Permuter:
 
     # ------------------------------------------------------------------ an external worker (decomp-permuter)
 
-    def _start_external(self, slug: str, cmd: list[str], options: dict) -> State:
+    def _start_external(self, slug: str, cmd: list[str], options: dict, host: str = "") -> State:
         minutes = min(max(float(options.get("minutes") or 10), 0.5), 240)
         max_score = min(max(int(options.get("max_score") or 150), 1), 1_000_000)
         threads = min(max(int(options.get("threads") or 0), 0), 128)
@@ -125,12 +140,19 @@ class Permuter:
         args = ["--progress", "--db", db, "--minutes", f"{minutes:g}", "--max-score", str(max_score)]
         args += ["--threads", str(threads)] if threads else []
         args += ["--functions", names] if names else []
+        if host:  # its own agent and folder, so it claims its own functions beside the local worker
+            tag = re.sub(r"[^\w]+", "-", host).strip("-")
+            work = Path(self.net.project_row(slug)["root"]) / "tools/permute" / f"dp-{tag}"
+            args += ["--remote", host, "--agent", f"permuter-{tag}", "--work", str(work)]
         st = State(mode=EXTERNAL, options={"minutes": minutes, "threads": threads, "max_score": max_score,
-                                           "functions": names})
+                                           "functions": names, "remote": host})
         st.proc = subprocess.Popen(cmd + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                    bufsize=1, start_new_session=True)
-        self.jobs[slug] = st
-        threading.Thread(target=self._read_external, args=(st,), daemon=True, name=f"permuter-{slug}").start()
+        if host:
+            self.remotes.setdefault(slug, {})[host] = st
+        else:
+            self.jobs[slug] = st
+        threading.Thread(target=self._read_external, args=(st,), daemon=True, name=f"permuter-{slug}-{host}").start()
         return st
 
     def _read_external(self, st: State) -> None:

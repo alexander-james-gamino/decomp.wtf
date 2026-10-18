@@ -645,9 +645,9 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
     def p_permuter(slug, request, data):
         """The Permuter button: a project's own worker (decomp-permuter) with the options shown next to it."""
         if data.get("action") == "stop":
-            net.permuter.stop(slug)
+            net.permuter.stop(slug, str(data.get("remote") or ""))
         else:
-            opts = {k: data.get(k) for k in ("minutes", "threads", "max_score", "functions")}
+            opts = {k: data.get(k) for k in ("minutes", "threads", "max_score", "functions", "remote")}
             if net.permuter.start(slug, opts, manual=True) is None:
                 raise ValueError("this project has no permuter worker (tools/permute/dp_worker.py)")
         return net.overview(slug)

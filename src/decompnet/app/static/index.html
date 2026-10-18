@@ -241,6 +241,12 @@
           <label title="Only functions whose best score is at most this">Max score <input id="pmMax" type="number" min="1" max="1000000" value="150"></label>
           <label class="pm-fns" title="Comma-separated; empty = every close call">Only <input id="pmFns" placeholder="func_A, func_B (optional)"></label>
         </div>
+        <div class="pm-opts pm-remote" id="pmRemote">
+          <label title="An SSH host set up with tools/permute/remote_setup.sh: its CPU permutes, claims and judging stay here">Another machine <input id="pmHost" placeholder="192.168.1.118"></label>
+          <label title="Permuter processes there; 0 = all of that machine's cores">Threads there <input id="pmHostThr" type="number" min="0" max="256" value="0"></label>
+          <button class="ghost small-btn" id="pmHostBtn" type="button">Run there</button>
+        </div>
+        <ul class="pm-workers" id="pmWorkers"></ul>
       </div>
       <button class="ghost small-btn" id="pmBtn" type="button"></button>
     </div>

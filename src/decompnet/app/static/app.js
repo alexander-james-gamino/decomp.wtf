@@ -2377,6 +2377,7 @@ function renderPermuter(ov) {
     $("pmSub").textContent = "Runs decomp-permuter on functions whose C is right but registers or order differ: it holds each one, submits improvements through the judge and stops when none are left.";
     $("pmBtn").textContent = "Run permuter";
   }
+  renderRemotePermuters(pm);
   $("pmBtn").onclick = async () => {
     $("pmBtn").disabled = true;
     const opts = { minutes: Number($("pmMin").value) || 10, threads: Number($("pmThr").value) || 0,
@@ -2386,6 +2387,44 @@ function renderPermuter(ov) {
       S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: running ? "stop" : "start", ...opts } });
       renderPermuter(S.ov);
     } catch (e) { toast(esc(e.message), "err"); } finally { $("pmBtn").disabled = false; }
+  };
+}
+
+/* Permuter workers on other machines (SSH hosts set up with tools/permute/remote_setup.sh): one line each, so you
+   can see they're getting work, with their own Stop. */
+const PM_HOST_KEY = "permuterHost";
+function renderRemotePermuters(pm) {
+  const rem = pm.remotes || [];
+  if (!$("pmHost").dataset.init) {
+    $("pmHost").dataset.init = "1";
+    try { const h = JSON.parse(localStorage.getItem(PM_HOST_KEY) || "{}"); if (h.host) $("pmHost").value = h.host; if (h.threads != null) $("pmHostThr").value = h.threads; } catch (e) { /* defaults */ }
+  }
+  const line = (r) => {
+    const o = r.options || {};
+    const state = r.state === "running" ? (r.current ? `on ${esc(r.current)} (best ${r.current_best})` : "picking the next close call")
+      : r.state === "failed" ? `<span class="err">stopped with an error: ${esc(r.error || "")}</span>` : esc(r.state || "");
+    return `<li><b>${esc(r.host)}</b><span>${state}</span><span class="muted">${r.tried} of ${r.total || "?"} tried${r.matched ? ` · <span class="ok">${r.matched} matched</span>` : ""}${o.threads ? ` · ${o.threads} threads` : ""}</span>`
+      + (r.state === "running" ? `<button class="link-btn" type="button" data-pm-stop="${esc(r.host)}">Stop</button>` : "") + "</li>";
+  };
+  $("pmWorkers").innerHTML = rem.map(line).join("");
+  $("pmWorkers").querySelectorAll("[data-pm-stop]").forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try { S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: "stop", remote: b.dataset.pmStop } }); renderPermuter(S.ov); }
+      catch (e) { toast(esc(e.message), "err"); }
+    };
+  });
+  $("pmHostBtn").onclick = async () => {
+    const host = $("pmHost").value.trim();
+    if (!host) { toast("Type the other machine's address first (set it up with tools/permute/remote_setup.sh).", "err"); return; }
+    const threads = Number($("pmHostThr").value) || 0;
+    try { localStorage.setItem(PM_HOST_KEY, JSON.stringify({ host, threads })); } catch (e) { /* not kept: fine */ }
+    $("pmHostBtn").disabled = true;
+    try {
+      S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: "start", remote: host, threads,
+        minutes: Number($("pmMin").value) || 10, max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim() } });
+      renderPermuter(S.ov);
+    } catch (e) { toast(esc(e.message), "err"); } finally { $("pmHostBtn").disabled = false; }
   };
 }
 
