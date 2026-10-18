@@ -2370,7 +2370,7 @@ function renderPermuter(ov) {
     const how = pm.state === "failed" ? "stopped with an error" : pm.state === "stopped" ? "stopped" : "finished";
     $("pmTitle").innerHTML = `Permuter ${how}${won}`;
     $("pmSub").textContent = pm.state === "failed" ? (pm.error || "")
-      : `${plural(pm.tried, "close call")} tried${pm.matched_names && pm.matched_names.length ? `: matched ${pm.matched_names.join(", ")}` : ""}. A function is tried again only after someone improves it.`;
+      : `${plural(pm.tried, "close call")} tried${pm.matched_names && pm.matched_names.length ? `: matched ${pm.matched_names.join(", ")}` : ""}. Each function gets up to 3 runs, then goes back to the agents.`;
     $("pmBtn").textContent = "Run again";
   } else {
     $("pmTitle").textContent = "Permuter for close calls";
