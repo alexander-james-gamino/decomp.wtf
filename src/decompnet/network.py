@@ -192,7 +192,8 @@ class Network:
 
     def _expire_claims(self, db) -> None:
         now = time.time()
-        own = {r["id"] for r in db.execute("SELECT id FROM agents WHERE name IN (?, ?)", MACHINE_AGENTS)}
+        own = {r["id"] for r in db.execute("SELECT id FROM agents WHERE name IN (?, ?) OR name LIKE 'permuter-%'",
+                                            MACHINE_AGENTS)}  # more permuter workers: permuter-2, ...
         for row in db.execute("SELECT c.function_id, c.agent_id, f.project_id, f.name FROM claims c "
                               "JOIN functions f ON f.id=c.function_id WHERE c.expires_at < ?", (now,)).fetchall():
             if row["agent_id"] in own:  # decomp.wtf's own tries (cut short by a restart): nobody gave up on it
