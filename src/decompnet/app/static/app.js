@@ -754,9 +754,12 @@ function renderStats(ov) {
   $("pct").textContent = pctNum(pct);
   const counts = ov.bytes - (ov.asm_bytes || 0);  // without what's set aside (Sony SDK code, hand-written assembly)
   $("pctSub").textContent = (ov.bytes ? `${bytes(ov.matched_bytes)} of ${bytes(ov.bytes)}` : "")
-    + (ov.asm_bytes && counts > 0 ? ` · ${pctNum((100 * ov.matched_bytes) / counts)}% of the code that counts (Sony SDK and assembly set aside)` : "")
+    + (ov.asm_bytes && counts > 0 ? ` · ${pctNum((100 * ov.matched_bytes) / counts)}% of the code that counts `
+      + `(${bytes(ov.asm_bytes)} set aside: ${bytes(ov.sdk_bytes || 0)} Sony SDK, ${bytes(ov.asm_bytes - (ov.sdk_bytes || 0))} assembly)` : "")
     + linkedText(ov) + (S.today ? ` · ${S.today} matched today` : "");
   // the average function's completeness (its best attempt, matched ones as 100%): shows work that's nearly there
+  $("lgAsm").hidden = !(ov.asm_bytes && counts > 0);
+  $("lgSdk").hidden = !(ov.sdk_bytes && counts > 0);
   const avg = ov.avg_complete, avgw = ov.avg_complete_w;  // the second one weighs big functions more
   $("pctSub2").hidden = avg == null;
   if (avg != null)

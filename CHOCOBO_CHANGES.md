@@ -138,3 +138,7 @@ takes it. A permuter run no longer counts as an agent giving up (`abandons`).
   **Model tiers** in Settings. Off: every helper can claim anything (the size-based move-on nudge stays).
   A helper only learns its tier when it starts while the toggle is on; switching it off clears the stored
   tiers of helpers already working.
+- **Finishing the ROM-map SDK work** (`server.py` + `app.js`/`app.css`/`index.html`): the map's `/api/map` payload
+  forgot the `sdk` field (`MAP_KEYS`), so the red squares and the "Sony SDK" badge never reached the browser —
+  added; the map legend now shows "Sony SDK" (red) and "assembly" chips when anything is set aside; and the
+  matched-code line spells out the breakdown: "51.3 KB set aside: 38.5 KB Sony SDK, 12.8 KB assembly".

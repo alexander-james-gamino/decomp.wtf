@@ -327,7 +327,7 @@ a.ghost, a.primary { text-decoration: none; }
 .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
 .legend span { display: inline-flex; align-items: center; gap: 6px; }
 .sw { width: 10px; height: 10px; border-radius: 2.5px; display: inline-block; }
-.sw.open { background: var(--open); } .sw.tried { background: var(--tried); } .sw.work { background: var(--work); } .sw.match { background: var(--match); }
+.sw.open { background: var(--open); } .sw.tried { background: var(--tried); } .sw.work { background: var(--work); } .sw.match { background: var(--match); } .sw.sdk { background: var(--sdk); }
 .map-hint { padding: 12px 16px 0; }
 .map-wrap { position: relative; padding: 12px 16px 16px; }
 #map { display: block; width: 100%; cursor: crosshair; }
