@@ -343,8 +343,10 @@ class Network:
         t = tiers.get(self.tier_of(agent))
         if t is None and not self.routing_on():
             # routing off: anything open and unclaimed; what this agent released lately comes after everything else
-            # last of all: what an agent left for a human, then what this agent released lately; nothing is blocked
-            later = ("COALESCE(f.handoff, '') = 'human', "
+            # nothing is blocked, but the permuter's work comes after the real work: functions left for the permuter
+            # or already 98%+ there (best score within 2% of n_insns * 100) last; within each, what this agent
+            # released lately after the rest
+            later = ("(COALESCE(f.handoff, '') = 'permuter' OR (f.best_score IS NOT NULL AND f.best_score <= f.n_insns * 2)), "
                      f"f.name IN (SELECT detail FROM events WHERE project_id={int(proj['id'])} AND agent_id={int(agent.id)} "
                      f"AND kind='release' AND created_at > {float(now - RELEASE_RETRY)}), ")
             return ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims)",
