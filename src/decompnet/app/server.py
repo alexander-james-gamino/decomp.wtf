@@ -647,7 +647,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         if data.get("action") == "stop":
             net.permuter.stop(slug, str(data.get("remote") or ""))
         else:
-            opts = {k: data.get(k) for k in ("minutes", "threads", "max_score", "functions", "remote")}
+            opts = {k: data.get(k) for k in ("minutes", "threads", "max_score", "functions", "remote", "forever")}
             if net.permuter.start(slug, opts, manual=True) is None:
                 raise ValueError("this project has no permuter worker (tools/permute/dp_worker.py)")
         return net.overview(slug)

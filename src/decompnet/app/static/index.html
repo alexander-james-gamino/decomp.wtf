@@ -240,6 +240,7 @@
           <label title="Parallel permuter processes; 0 = all cores but two">Threads <input id="pmThr" type="number" min="0" max="128" value="0"></label>
           <label title="Only functions whose best score is at most this">Max score <input id="pmMax" type="number" min="1" max="1000000" value="150"></label>
           <label class="pm-fns" title="Comma-separated; empty = every close call">Only <input id="pmFns" placeholder="func_A, func_B (optional)"></label>
+          <label title="Never stop: when the queue is empty, go round again over near misses with longer runs; with nothing at all, look again every 5 minutes"><input type="checkbox" id="pmForever" checked> Keep going</label>
         </div>
         <div class="pm-opts pm-remote" id="pmRemote">
           <label title="An SSH host set up with tools/permute/remote_setup.sh: its CPU permutes, claims and judging stay here">Another machine <input id="pmHost" placeholder="192.168.1.118"></label>

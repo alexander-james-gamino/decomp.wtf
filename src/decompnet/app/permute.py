@@ -60,6 +60,7 @@ class State:
     log: list = field(default_factory=list)
     error: str = ""
     proc: subprocess.Popen | None = None
+    idle: bool = False  # keep-going mode with nothing to permute right now (it looks again every few minutes)
 
 
 class Permuter:
@@ -140,12 +141,14 @@ class Permuter:
         args = ["--progress", "--db", db, "--minutes", f"{minutes:g}", "--max-score", str(max_score)]
         args += ["--threads", str(threads)] if threads else []
         args += ["--functions", names] if names else []
+        forever = bool(options.get("forever"))
+        args += ["--forever"] if forever else []
         if host:  # its own agent and folder, so it claims its own functions beside the local worker
             tag = re.sub(r"[^\w]+", "-", host).strip("-")
             work = Path(self.net.project_row(slug)["root"]) / "tools/permute" / f"dp-{tag}"
             args += ["--remote", host, "--agent", f"permuter-{tag}", "--work", str(work)]
         st = State(mode=EXTERNAL, options={"minutes": minutes, "threads": threads, "max_score": max_score,
-                                           "functions": names, "remote": host})
+                                           "functions": names, "remote": host, "forever": forever})
         st.proc = subprocess.Popen(cmd + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                    bufsize=1, start_new_session=True)
         if host:
@@ -170,7 +173,9 @@ class Permuter:
             if kind in ("start", "more"):
                 st.total = ev.get("total", st.total)
             elif kind == "function":
-                st.current, st.current_best = ev.get("name") or "", ev.get("best")
+                st.current, st.current_best, st.idle = ev.get("name") or "", ev.get("best"), False
+            elif kind == "idle":
+                st.current, st.idle = "", True
             elif kind == "result":
                 st.tried = ev.get("done", st.tried + 1)
                 st.current = ""

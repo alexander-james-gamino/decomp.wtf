@@ -2354,6 +2354,7 @@ function renderPermuter(ov) {
     if (o.threads != null) $("pmThr").value = o.threads;
     if (o.max_score) $("pmMax").value = o.max_score;
     if (o.functions) $("pmFns").value = o.functions;
+    if (o.forever != null) $("pmForever").checked = !!o.forever;
   }
   const running = pm.state === "running";
   box.classList.toggle("on", running);
@@ -2362,7 +2363,7 @@ function renderPermuter(ov) {
   const won = pm.matched ? ` · <span class="ok">${pm.matched} matched</span>` : "";
   if (running) {
     const o = pm.options || {};
-    $("pmTitle").innerHTML = `Permuter: ${pm.current ? `working on ${esc(pm.current)} (best ${pm.current_best})` : "picking the next close call"}${won}`;
+    $("pmTitle").innerHTML = `Permuter: ${pm.current ? `working on ${esc(pm.current)} (best ${pm.current_best})` : pm.idle ? "waiting for new close calls (looks again every 5 min)" : "picking the next close call"}${won}`;
     $("pmSub").textContent = `${pm.tried} of ${pm.total || "?"} close calls tried · ${o.minutes} min each, best score ≤ ${o.max_score}${o.functions ? ` · only ${o.functions}` : ""}. It holds each function, so agents work elsewhere.`;
     $("pmBar").firstElementChild.style.width = `${(100 * pm.tried) / Math.max(1, pm.total)}%`;
     $("pmBtn").textContent = "Stop";
@@ -2381,7 +2382,7 @@ function renderPermuter(ov) {
   $("pmBtn").onclick = async () => {
     $("pmBtn").disabled = true;
     const opts = { minutes: Number($("pmMin").value) || 10, threads: Number($("pmThr").value) || 0,
-                   max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim() };
+                   max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim(), forever: $("pmForever").checked };
     try { localStorage.setItem(PM_KEY, JSON.stringify(opts)); } catch (e) { /* not kept: fine */ }
     try {
       S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: running ? "stop" : "start", ...opts } });
@@ -2401,9 +2402,10 @@ function renderRemotePermuters(pm) {
   }
   const line = (r) => {
     const o = r.options || {};
-    const state = r.state === "running" ? (r.current ? `on ${esc(r.current)} (best ${r.current_best})` : "picking the next close call")
+    const state = r.state === "running" ? (r.current ? `on ${esc(r.current)} (best ${r.current_best})` : r.idle ? "waiting for new close calls (looks again every 5 min)" : "picking the next close call")
       : r.state === "failed" ? `<span class="err">stopped with an error: ${esc(r.error || "")}</span>` : esc(r.state || "");
-    return `<li><b>${esc(r.host)}</b><span>${state}</span><span class="muted">${r.tried} of ${r.total || "?"} tried${r.matched ? ` · <span class="ok">${r.matched} matched</span>` : ""}${o.threads ? ` · ${o.threads} threads` : ""}</span>`
+    const bar = r.state === "running" && r.total ? `<span class="upbar"><i style="width:${Math.min(100, (100 * r.tried) / r.total)}%"></i></span>` : "";
+    return `<li><b>${esc(r.host)}</b>${bar}<span>${state}</span><span class="muted">${r.tried} of ${r.total || "?"} tried${r.matched ? ` · <span class="ok">${r.matched} matched</span>` : ""}${o.threads ? ` · ${o.threads} threads` : ""}${o.forever ? " · keeps going" : ""}</span>`
       + (r.state === "running" ? `<button class="link-btn" type="button" data-pm-stop="${esc(r.host)}">Stop</button>` : "") + "</li>";
   };
   $("pmWorkers").innerHTML = rem.map(line).join("");
@@ -2422,7 +2424,7 @@ function renderRemotePermuters(pm) {
     $("pmHostBtn").disabled = true;
     try {
       S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: "start", remote: host, threads,
-        minutes: Number($("pmMin").value) || 10, max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim() } });
+        minutes: Number($("pmMin").value) || 10, max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim(), forever: $("pmForever").checked } });
       renderPermuter(S.ov);
     } catch (e) { toast(esc(e.message), "err"); } finally { $("pmHostBtn").disabled = false; }
   };
