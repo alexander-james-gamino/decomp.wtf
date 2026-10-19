@@ -117,6 +117,7 @@ class Store:
                 UPDATE functions SET handoff='permuter', handoff_at=strftime('%s','now'),
                     handoff_note='from an earlier note: registers/order only, for the permuter'
                   WHERE status='open' AND handoff IS NULL AND best_source IS NOT NULL AND best_score > 0
+                    AND best_score <= n_insns * 3
                     AND id IN (SELECT function_id FROM notes WHERE function_id IS NOT NULL AND (
                         text LIKE '%regalloc only%' OR text LIKE '%regalloc-only%' OR text LIKE '%permuter only%'
                         OR text LIKE '%only: permuter%' OR text LIKE '%leave it to the permuter%'));

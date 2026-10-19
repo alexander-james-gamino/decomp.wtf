@@ -425,6 +425,13 @@ class Network:
 
     # ------------------------------------------------------------- the permuter's queue
 
+    def permuter_work(self, fn) -> bool:
+        """Whether a function is the permuter's kind of work: a best attempt to start from whose diff is registers/
+        order only, or that is within 3% of matching (score <= 3 per instruction), and permuter runs left."""
+        if not fn["best_source"] or not (fn["best_score"] or 0) > 0 or fn["permuter_turns"] >= PERMUTER_TURNS:
+            return False
+        return (fn["best_kind"] or "") == "regalloc" or fn["best_score"] <= 3 * (fn["n_insns"] or 0)
+
     def permuter_queue(self, proj, limit: int = 20, max_score: int | None = None, near: float = 0.06,
                        max_insns: int = 400) -> list:
         """What the permuter should run on next, best bets first: functions agents left for it, then near misses
@@ -485,13 +492,17 @@ class Network:
         if leave_for and leave_for not in LEAVE_FOR:
             raise NetworkError(f"leave_for must be one of: {', '.join(LEAVE_FOR)} (or empty)")
         why = notes.strip()
-        if not leave_for and (fn["best_score"] or 0) > 0 and fn["best_source"]:
-            if (fn["best_kind"] or "") == "regalloc":
-                leave_for, why = "permuter", "auto: the best attempt differs only in registers/order. " + why
-            elif re.search(r"\bregalloc(?:ation)?[- ]only\b|\bpermuter\b", notes, re.I):
-                leave_for = "permuter"
-        if leave_for == "permuter" and (not fn["best_source"] or fn["permuter_turns"] >= PERMUTER_TURNS):
-            leave_for = ""  # nothing for it to permute, or it already had its runs: stays with the agents
+        refused = ""
+        if not leave_for and self.permuter_work(fn) and (
+                (fn["best_kind"] or "") == "regalloc"
+                or re.search(r"(?<!not )(?<!no )\bregalloc(?:ation)?[- ]only\b", notes, re.I)):
+            leave_for, why = "permuter", "auto: the best attempt differs only in registers/order. " + why
+        if leave_for == "permuter" and not self.permuter_work(fn):
+            # the permuter only reorders code and reshuffles registers: a function whose best attempt still differs
+            # in real instructions would only sit in its queue, and agents would never get it back
+            leave_for = ""
+            refused = (" Not left for the permuter: its best attempt still differs in real instructions (or the "
+                       "permuter already had its runs), so it stays with the agents.")
         now = time.time()
         with self.store.tx() as db:
             row = db.execute("SELECT agent_id FROM claims WHERE function_id=?", (fn["id"],)).fetchone()
@@ -509,7 +520,7 @@ class Network:
         left = {"permuter": " Left for the permuter: agents get it back only if the permuter can't match it.",
                 "human": " Left for a human: no agent gets it automatically until someone looks at it."}
         return (f"Released {fn['name']}. Your best attempt and notes are saved so the next agent starts "
-                f"where you left off.{left.get(leave_for, '')} Call claim_function for a new one.")
+                f"where you left off.{left.get(leave_for, '')}{refused} Call claim_function for a new one.")
 
     def get_function(self, function: str, project: str | None = None, agent: Agent | None = None) -> str:
         return self._brief(self._function(function, project), agent, header="VIEW")

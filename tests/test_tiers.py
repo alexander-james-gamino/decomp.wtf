@@ -100,7 +100,8 @@ def test_left_for_the_permuter_and_its_queue(tmp_path):
     pid = _project(net, tmp_path, [
         {"name": "regs", "n_insns": 40, "best_score": 25, "best_source": "int a;", "best_kind": "regalloc"},
         {"name": "said_so", "n_insns": 40, "best_score": 90, "best_source": "int b;", "best_kind": "structure"},
-        {"name": "asked", "n_insns": 40, "best_score": 300, "best_source": "int c;", "best_kind": "structure"},
+        {"name": "asked", "n_insns": 40, "best_score": 100, "best_source": "int c;", "best_kind": "structure"},
+        {"name": "too_far", "n_insns": 40, "best_score": 900, "best_source": "int f;", "best_kind": "structure"},
         {"name": "close", "n_insns": 100, "best_score": 50, "best_source": "int d;", "best_kind": "structure"},
         {"name": "data_only", "n_insns": 40, "best_score": 1, "best_source": "int e;", "best_kind": "data"},
         {"name": "fresh", "n_insns": 12},
@@ -110,12 +111,18 @@ def test_left_for_the_permuter_and_its_queue(tmp_path):
                                ("asked", "registers left", "permuter"), ("data_only", "jtbl reads wrong", "human")]:
         net.claim_row(agent, "game", name)
         assert "Left for " in net.release(agent, name, notes, "game", leave)
+    # 77% there with real instruction differences: the permuter can't fix that, so it stays with the agents
+    net.claim_row(agent, "game", "too_far")
+    assert "Not left for the permuter" in net.release(agent, "too_far", "permuter only, I give up", "game", "permuter")
     hand = {r["name"]: r["handoff"] for r in net.store.all("SELECT name, handoff FROM functions WHERE project_id=?", pid)}
     assert hand == {"regs": "permuter", "said_so": "permuter", "asked": "permuter", "close": None,
-                    "data_only": "human", "fresh": None}
+                    "data_only": "human", "fresh": None, "too_far": None}
     other = _agent(net, "claude-2", None)
     assert net.claim_row(other, "game", None, "closest")["name"] == "close"  # handed-off ones never come automatically
     net.release(other, "close", "", "game")
+    assert net.claim_row(other, "game", None, "closest")["name"] in ("too_far", "fresh")  # too_far stayed with agents
+    net.release(other, net.store.one("SELECT f.name FROM claims c JOIN functions f ON f.id=c.function_id "
+                                     "WHERE c.agent_id=?", other.id)["name"], "", "game")
     proj = net.project_row("game")
     queue = [r["name"] for r in net.permuter_queue(proj)]
     assert queue[:3] == ["regs", "said_so", "asked"] and "data_only" not in queue, queue
@@ -235,17 +242,19 @@ def test_notes_from_before_handoffs_hand_their_functions_to_the_permuter_once(tm
     from decompnet.store import Store
 
     net = RomNetwork(tmp_path / "app.db", tmp_path)
-    pid = _project(net, tmp_path, [{"name": "said_permuter", "n_insns": 40, "best_score": 340, "best_source": "int a;"},
+    pid = _project(net, tmp_path, [{"name": "said_permuter", "n_insns": 40, "best_score": 100, "best_source": "int a;"},
+                                   {"name": "far_but_said", "n_insns": 40, "best_score": 900, "best_source": "int c;"},
                                    {"name": "no_attempt", "n_insns": 40},
                                    {"name": "other_note", "n_insns": 40, "best_score": 90, "best_source": "int b;"}])
     with net.store.tx() as db:
         db.execute("UPDATE functions SET handoff=NULL")
         db.execute("DELETE FROM settings WHERE key='handoffs_from_notes'")  # as in a database from before
-        for name, text in [("said_permuter", "Best 340 stays; regalloc only: permuter. Queue keeps re-serving this."),
+        for name, text in [("said_permuter", "Best 100 stays; regalloc only: permuter. Queue keeps re-serving this."),
+                           ("far_but_said", "regalloc only: permuter (but still 77% there)"),
                            ("no_attempt", "permuter only"), ("other_note", "tried a for loop instead")]:
             fid = net._function(name, "game")["id"]
             db.execute("INSERT INTO notes(project_id,function_id,agent_id,text,created_at) VALUES(?,?,?,?,0)",
                        (pid, fid, None, text))
     store = Store(tmp_path / "app.db")
     hand = {r["name"]: r["handoff"] for r in store.all("SELECT name, handoff FROM functions")}
-    assert hand == {"said_permuter": "permuter", "no_attempt": None, "other_note": None}
+    assert hand == {"said_permuter": "permuter", "far_but_said": None, "no_attempt": None, "other_note": None}
