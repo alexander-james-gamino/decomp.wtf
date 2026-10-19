@@ -166,11 +166,11 @@ class Permuter:
             st.state = "done"
 
     def candidates(self, proj, limit: int = 20) -> list:
-        return [r for r in self.net.store.all(
-            "SELECT * FROM functions WHERE project_id=? AND status='open' AND best_source IS NOT NULL "
-            "AND best_score > 0 AND best_score <= n_insns * 100 * ? AND n_insns <= 400 "
-            "AND id NOT IN (SELECT function_id FROM claims) ORDER BY CAST(best_score AS REAL) / (n_insns * 100) LIMIT ?",
-            proj["id"], NEAR, limit * 4) if self._turns.get(r["id"], 0) < MAX_TURNS][:limit]
+        """What to permute next (network.permuter_queue): functions agents left for the permuter, then near misses
+        whose best attempt differs only in registers/order, then the closest near misses; minus the ones this run
+        already spent its turns on."""
+        return [r for r in self.net.permuter_queue(proj, limit * 4, near=NEAR)
+                if self._turns.get(r["id"], 0) < MAX_TURNS][:limit]
 
     def _loop(self, slug: str, st: State) -> None:
         agent, _ = self.net.local_agent("permuter")
@@ -197,6 +197,8 @@ class Permuter:
                         self._permute(agent, proj, fn, st)
                     except Exception as e:  # one odd function must not stop the rest
                         log.info("permuter: %s: %s", fn["name"], e)
+                    if self._turns[fn["id"]] >= MAX_TURNS:  # one permuter run done: after a few, back to agents
+                        self.net.permuter_done(agent, fn["id"])
         finally:
             st.state = "stopped" if st.stop.is_set() else "done"
             st.current = ""

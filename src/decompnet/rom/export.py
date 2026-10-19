@@ -58,14 +58,21 @@ def _first_address(path: Path) -> tuple[int | None, int | None]:
 
 
 def _symbol_lines(net, proj) -> list[str]:
-    """symbol_addrs.txt entries for every function and every named symbol, so splat writes the project's names."""
+    """symbol_addrs.txt entries for every function and every named symbol, so splat writes the project's names.
+
+    One line per function, pinned to where its bytes are (rom:). Overlays a game loads at the same address have
+    functions at the same addresses: a bare `name = address` applies to every one of them, so splat cut the other
+    overlays' code at that address (fake functions starting mid-function) and gave them the wrong names."""
     syms = net.symbols(proj["id"])
-    funcs = {r["vram"]: r for r in net.store.all("SELECT name, vram, size FROM functions WHERE project_id=?", proj["id"])}
-    lines = []
-    for vram, r in sorted(funcs.items()):
-        lines.append(f"{r['name']} = 0x{vram:08X}; // type:func")
+    rows = net.store.all("SELECT name, vram, rom_offset FROM functions WHERE project_id=? AND vram IS NOT NULL "
+                         "ORDER BY vram, rom_offset", proj["id"])
+    lines, addrs = [], set()
+    for r in rows:
+        rom = f" rom:0x{r['rom_offset']:X}" if r["rom_offset"] is not None else ""
+        lines.append(f"{r['name']} = 0x{r['vram']:08X}; // type:func{rom}")
+        addrs.add(r["vram"])
     for s in sorted(syms.by_name.values(), key=lambda s: s.address):
-        if s.address in funcs or AUTO_NAME.match(s.name):
+        if s.address in addrs or AUTO_NAME.match(s.name):
             continue
         lines.append(f"{s.name} = 0x{s.address:08X};")
     return lines
@@ -128,7 +135,12 @@ def export_rom(net, slug: str, out: Path, log=print) -> dict:
         ld.rename(out / f"splat-{ld.name}")
 
     # 2. which function is where, and which are matched
-    rows = {r["vram"]: r for r in net.store.all("SELECT * FROM functions WHERE project_id=?", proj["id"])}
+    # by address and where the bytes are: overlays share addresses, so the address alone can name another
+    # overlay's function (whose C then landed in every overlay at that address)
+    rows, by_vram = {}, {}
+    for r in net.store.all("SELECT * FROM functions WHERE project_id=?", proj["id"]):
+        rows[(r["vram"], r["rom_offset"])] = r
+        by_vram.setdefault(r["vram"], []).append(r)
     units = net._unit_contexts(proj["id"])
     header = net._context(proj["id"])["header"]
     (out / "include").mkdir(exist_ok=True)
@@ -146,7 +158,9 @@ def export_rom(net, slug: str, out: Path, log=print) -> dict:
 
     objects, private, as_fallback = [], [], []
     for f in functions:
-        row = rows.get(f["vram"])
+        row = rows.get((f["vram"], f["rom"]))
+        if row is None and len(by_vram.get(f["vram"], ())) == 1 and by_vram[f["vram"]][0]["rom_offset"] is None:
+            row = by_vram[f["vram"]][0]  # a project imported before functions knew where their bytes are
         f["obj_asm"] = f"build/{Path(f['asm']).with_suffix('.o').as_posix()}"
         if row is None or row["status"] != "matched" or not row["matched_source"]:
             f["kind"] = "asm"
@@ -158,7 +172,7 @@ def export_rom(net, slug: str, out: Path, log=print) -> dict:
             as_fallback.append((f["name"], "doesn't compile any more"))
             f["kind"] = "asm"
             continue
-        linked = match.link(compiled.obj, row["name"], net._rom_target(row), net.symbols(proj["id"]), net.reader(proj))
+        linked = match.link(compiled.obj, row["name"], net._rom_target(row), net.symbols(proj["id"]), net.reader(proj, row))
         if not linked.exact:
             as_fallback.append((f["name"], "no longer matches"))
             f["kind"] = "asm"

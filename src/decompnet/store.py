@@ -62,6 +62,12 @@ MIGRATIONS = [
     ("functions", "rom_offset", "INTEGER"),                    # ROM projects: where its bytes are in the ROM
     ("functions", "meta", "TEXT"),                             # forks: symbol, demangled name, source file
     ("functions", "boost", "INTEGER NOT NULL DEFAULT 0"),      # claim order: >0 matching it matches that many twins
+    ("agents", "tier", "TEXT"),                                # model tier (tiers.py): local | small | medium | large
+    ("functions", "handoff", "TEXT"),                          # left for: permuter | human (no automatic claims)
+    ("functions", "handoff_note", "TEXT"),                     # why it was left, by whom
+    ("functions", "handoff_at", "REAL"),
+    ("functions", "best_kind", "TEXT"),                        # the best attempt's diff: regalloc | structure | data
+    ("functions", "permuter_turns", "INTEGER NOT NULL DEFAULT 0"),  # permuter runs on it that didn't match
 ]
 
 
@@ -102,6 +108,19 @@ class Store:
                                                           AND g.name=functions.name), 0) WHERE abandons > 0;
                 DROP TABLE gave_up;
                 INSERT INTO settings(key, value) VALUES('abandons_recounted', '1');
+                COMMIT;""")
+        # before handoffs existed, agents could only say "regalloc only: permuter" in a note, and the queue kept handing
+        # those functions out anyway. Once: what a note left for the permuter (with an attempt to start from) is its
+        if self.conn.execute("SELECT 1 FROM settings WHERE key='handoffs_from_notes'").fetchone() is None:
+            self.conn.executescript("""
+                BEGIN;
+                UPDATE functions SET handoff='permuter', handoff_at=strftime('%s','now'),
+                    handoff_note='from an earlier note: registers/order only, for the permuter'
+                  WHERE status='open' AND handoff IS NULL AND best_source IS NOT NULL AND best_score > 0
+                    AND id IN (SELECT function_id FROM notes WHERE function_id IS NOT NULL AND (
+                        text LIKE '%regalloc only%' OR text LIKE '%regalloc-only%' OR text LIKE '%permuter only%'
+                        OR text LIKE '%only: permuter%' OR text LIKE '%leave it to the permuter%'));
+                INSERT INTO settings(key, value) VALUES('handoffs_from_notes', '1');
                 COMMIT;""")
         self.lock = threading.RLock()
 

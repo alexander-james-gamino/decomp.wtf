@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from .. import scoring, seeds, similarity, toolchains
+from .. import network, scoring, seeds, similarity, tiers, toolchains
 from ..elfobj import FunctionObj
 from ..network import Agent, Network, NetworkError, _hash_token
 from ..rom import detect, match, split
@@ -72,6 +72,8 @@ TOOLS = {
 }
 # Functions this small are handed out in batches (claim_function count): agents match most on the first try.
 BATCH_INSNS = 48
+# The user's instructions for a project's agents (Setup): kept whole up to this (4000 used to cut playbooks off mid-rule).
+INSTRUCTIONS_MAX = 12000
 PLATFORM_COMPILERS = {"n64": ["gcc-2.7.2-kmc", "ido-7.1", "ido-5.3"], "psx": ["gcc-2.7.2-psx", "gcc-2.8.1-psx"],
                       "ps2": ["ee-gcc-2.96"], "gba": ["agbcc"]}
 _AUTO_TOKEN = re.compile(r"\b(?:func|D|B|jtbl|RO|STR|FLT|DBL)_[0-9A-F]{8}\b")
@@ -189,11 +191,16 @@ class RomNetwork(Network):
             self._roms[proj["id"]] = (rom, segs)
         return self._roms[proj["id"]]
 
-    def reader(self, proj):
+    def reader(self, proj, fn=None):
+        """Bytes at an address as function `fn` sees them: its own segment first, then the segments no other one
+        overlaps. Overlays a game loads at the same address are never mixed up: the first segment containing an
+        address used to win, so every overlay's jump tables and data read as the first overlay's. Without a
+        function, an address only overlays share reads as nothing rather than as some overlay's bytes."""
         rom, segs = self._rom(proj)
+        order = split.visible_segments(segs, fn["rom_offset"] if fn is not None else None)
 
         def read(addr: int, n: int) -> bytes | None:
-            for seg in segs:
+            for seg in order:
                 if seg.contains(addr, n):
                     at = seg.rom_start + addr - seg.vram
                     return rom[at:at + n]
@@ -312,9 +319,9 @@ class RomNetwork(Network):
             from ..rom import match_arm
 
             res = match_arm.link(obj, fn["name"], match_arm.ArmTarget(fn["name"], fn["vram"], fn["target"]),
-                                 self.symbols(proj["id"]), self.reader(proj))
+                                 self.symbols(proj["id"]), self.reader(proj, fn))
             return res.candidate, res.exact if res.candidate is not None else None, res.problems
-        res = match.link(obj, fn["name"], self._rom_target(fn), self.symbols(proj["id"]), self.reader(proj))
+        res = match.link(obj, fn["name"], self._rom_target(fn), self.symbols(proj["id"]), self.reader(proj, fn))
         return res.candidate, res.exact if res.candidate is not None else None, res.problems
 
     def _twin_lines(self, proj, fn) -> list[str]:
@@ -413,7 +420,9 @@ class RomNetwork(Network):
             if d.name in symbols.by_name:
                 continue
             symbols.add(Symbol(d.name, d.vram, d.size, d.kind), reindex=False)
-            data_rows.append((d.name, d.vram, d.size, d.kind, _preview(read(d.vram, min(d.size, 48)), d.kind) if d.kind != "bss" else ""))
+            # its own bytes, from where splat found them (by address, an overlay's data would read as another's)
+            raw = rom_bytes[d.rom:d.rom + min(d.size, 48)] if d.rom is not None else read(d.vram, min(d.size, 48))
+            data_rows.append((d.name, d.vram, d.size, d.kind, _preview(raw, d.kind) if d.kind != "bss" else ""))
         symbols._reindex()
 
         now = time.time()
@@ -544,7 +553,7 @@ class RomNetwork(Network):
 
     def _jtbl_asm(self, proj, fn) -> list[str]:
         out = [".section .rodata"]
-        read = self.reader(proj)
+        read = self.reader(proj, fn)
         syms = self.symbols(proj["id"])
         for m in sorted(set(re.findall(r"jtbl_([0-9A-F]{8})", fn["asm"]))):
             addr = int(m, 16)
@@ -694,19 +703,25 @@ class RomNetwork(Network):
         if (fork := self.fork_slug(project)):
             return self.forks.list_functions(fork, status, limit)
         proj = self._project(project)
-        where = "" if status == "all" else " AND f.status=?"
-        args = [proj["id"]] + ([] if status == "all" else [status])
+        if status in network.LEAVE_FOR:  # what was left for the permuter or a human, and why
+            where, args = " AND f.status='open' AND f.handoff=?", [proj["id"], status]
+        else:
+            where = "" if status == "all" else " AND f.status=?"
+            args = [proj["id"]] + ([] if status == "all" else [status])
         rows = self.store.all(
-            f"SELECT f.name, f.vram, f.n_insns, f.status, f.best_score, a.name AS claimed_by FROM functions f "
+            f"SELECT f.name, f.vram, f.n_insns, f.status, f.best_score, f.handoff, f.handoff_note, "
+            f"a.name AS claimed_by FROM functions f "
             f"LEFT JOIN claims c ON c.function_id=f.id LEFT JOIN agents a ON a.id=c.agent_id "
             f"WHERE f.project_id=?{where} ORDER BY f.vram LIMIT ?", *args, limit)
         if not rows:
             return f"No {status} functions."
-        return "\n".join(f"- {r['name']} @0x{r['vram']:08X}: {r['n_insns']} insns, {r['status']}"
+        return "\n".join(f"- {r['name']} @0x{(r['vram'] or 0):08X}: {r['n_insns']} insns, {r['status']}"
                          + (f", best score {r['best_score']}" if r["best_score"] is not None else "")
-                         + (f", claimed by {r['claimed_by']}" if r["claimed_by"] else "") for r in rows)
+                         + (f", claimed by {r['claimed_by']}" if r["claimed_by"] else "")
+                         + (f", left for the {r['handoff']}" + (f" ({r['handoff_note']})" if r["handoff_note"] else "")
+                            if r["handoff"] else "") for r in rows)
 
-    def read_data(self, project: str | None, what: str, length: int = 64) -> str:
+    def read_data(self, project: str | None, what: str, length: int = 64, agent: Agent | None = None) -> str:
         self._rom_only(project, "read_data")
         proj = self._project(project)
         syms = self.symbols(proj["id"])
@@ -715,7 +730,10 @@ class RomNetwork(Network):
         if addr is None:
             raise NetworkError(f"`{what}` is not an address or a known symbol")
         length = max(4, min(int(length), 512))
-        data = self.reader(proj)(addr, length)
+        # read as the function the agent is working on sees it (its own overlay's data, not another's)
+        held = self.store.one("SELECT f.* FROM claims c JOIN functions f ON f.id=c.function_id WHERE c.agent_id=? "
+                              "AND f.project_id=? ORDER BY c.claimed_at LIMIT 1", agent.id, proj["id"]) if agent else None
+        data = self.reader(proj, held)(addr, length)
         head = f"{syms.label(addr)} at 0x{addr:08X}"
         if data is None:
             sym = syms.by_addr.get(addr)
@@ -979,6 +997,8 @@ class RomNetwork(Network):
         neighbours in the same file. Most small functions match on the first try, so an agent writes them all and
         judges them in one compile_and_diff: a fraction of the turns. Big functions come alone."""
         count = max(1, min(int(count or 1), 6))
+        if (t := tiers.get(self.tier_of(agent))) is not None:
+            count = min(count, t.batch)  # a local model gets one at a time; a large one, at most two
         if count == 1 or self._link(project) is not None:
             return self.claim(agent, project, None, strategy)
         proj = self._project(project)
@@ -1008,13 +1028,16 @@ class RomNetwork(Network):
     def _batch_more(self, agent: Agent, proj, first, n: int) -> list:
         """Up to n more small open functions next to `first` (same file, nearest address), claimed for the agent."""
         now = time.time()
+        t = tiers.get(self.tier_of(agent))
+        biggest = min(BATCH_INSNS, t.max_insns) if t is not None and t.max_insns is not None else BATCH_INSNS
         with self.store.tx() as db:
             self._expire_claims(db)
             rows = db.execute(
                 "SELECT f.* FROM functions f WHERE f.project_id=? AND f.status='open' AND f.boost >= 0 AND f.n_insns <= ? "
                 "AND f.abandons = 0 AND f.unit=? AND f.id NOT IN (SELECT function_id FROM claims) "
+                "AND f.handoff IS NULL AND NOT (COALESCE(f.best_kind, '') = 'regalloc' AND f.best_score > 0) "
                 "ORDER BY ABS(COALESCE(f.vram, 0) - ?), f.id LIMIT ?",
-                (proj["id"], BATCH_INSNS, first["unit"], first["vram"] or 0, n)).fetchall()
+                (proj["id"], biggest, first["unit"], first["vram"] or 0, n)).fetchall()
             for r in rows:
                 db.execute("INSERT INTO claims VALUES(?,?,?,?)", (r["id"], agent.id, now, now + self.claim_ttl))
                 self._event(db, proj["id"], agent.id, "claim", r["name"])
@@ -1084,13 +1107,13 @@ class RomNetwork(Network):
             return
         self._record(fn, agent, score, source, self._context(fn["project_id"], fn["unit"])["version"], via="room")
 
-    def release(self, agent: Agent, function: str, notes: str, project: str | None = None) -> str:
+    def release(self, agent: Agent, function: str, notes: str, project: str | None = None, leave_for: str = "") -> str:
         if (fork := self.fork_slug(project)):
             return self.forks.release(agent, fork, function, notes)
         link = self._link(project)
         if link is not None:
             link.call("/collab/release", agent, function=self._function(function, project)["name"], notes=notes)
-        return super().release(agent, function, notes, project)
+        return super().release(agent, function, notes, project, leave_for)
 
     def edit_context(self, agent: Agent, project: str | None, old: str, new: str, message: str,
                      function: str | None = None) -> str:
@@ -1376,7 +1399,8 @@ class RomNetwork(Network):
 
     def set_instructions(self, slug: str, text: str) -> None:
         """What the user wants agents to know or focus on, given to every agent on this project."""
-        self._update_cfg(slug, lambda cfg: cfg.__setitem__("instructions", text.strip()[:4000]))
+        # long enough for a real playbook (it rides along in every helper session's prompt, so keep it to what matters)
+        self._update_cfg(slug, lambda cfg: cfg.__setitem__("instructions", text.strip()[:INSTRUCTIONS_MAX]))
 
     def instructions(self, slug: str) -> str:
         return self.cfg(self._project(slug)).get("instructions") or ""
@@ -1393,13 +1417,24 @@ class RomNetwork(Network):
     def claim_row(self, agent: Agent, project: str | None = None, function: str | None = None, strategy: str = "easiest"):
         if function is None and project and not self.fork_slug(project):
             proj = self._project(project)
+            now = time.time()
             for name in self.cfg(proj).get("priority", []):
-                row = self.store.one("SELECT f.id, f.status FROM functions f WHERE f.project_id=? AND f.name=?", proj["id"], name)
+                row = self.store.one("SELECT f.* FROM functions f WHERE f.project_id=? AND f.name=?", proj["id"], name)
                 held = self.store.one("SELECT 1 FROM claims WHERE agent_id=?", agent.id)
-                if row and row["status"] == "open" and not held and not self.store.one(
+                if not row or row["status"] != "open" or held or self.store.one(
                         "SELECT 1 FROM claims WHERE function_id=?", row["id"]):
-                    function = name
-                    break
+                    continue
+                # the same rules as every automatic claim: not one this agent gave up on, nor one anybody released
+                # within the cooldown (else the queue hands the same stuck function back again and again), nor one
+                # left for the permuter or a human, and only what suits the agent's model
+                if self.store.one("SELECT 1 FROM events WHERE project_id=? AND kind='release' AND detail=? "
+                                  "AND (agent_id=? OR created_at > ?)", proj["id"], name, agent.id,
+                                  now - network.RELEASE_COOLDOWN):
+                    continue
+                if not self.fits(agent, row):
+                    continue
+                function = name
+                break
         self._yield_autopilot(function, project)
         return Network.claim_row(self, agent, project, function, strategy)
 
