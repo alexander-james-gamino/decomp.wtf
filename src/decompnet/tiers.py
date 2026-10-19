@@ -56,7 +56,8 @@ TIERS: dict[str, Tier] = {
             "need to fight one.\n"
             "- Start from the best attempt or the draft in the brief; fix the first differing instruction first.\n"
             "- When compile_and_diff says to move on, release_function right away with what you tried.\n"
-            "- When only registers or instruction order differ, that's the permuter's job: release_function with\n"
+            "- When only registers or instruction order differ: try one pin from context.h on the register that\n"
+            "  differs (pins matched near misses the permuter couldn't), then release_function with\n"
             "  leave_for=\"permuter\"."),
     ),
     "medium": Tier(

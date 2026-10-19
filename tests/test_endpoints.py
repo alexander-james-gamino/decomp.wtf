@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from decompnet import tiers
 from decompnet.app import agents
 from decompnet.app.server import Settings, _session_options, _spread
 
@@ -42,6 +43,23 @@ def test_endpoints_are_added_changed_and_removed(tmp_path):
     s.remove_endpoint("e1")
     assert [e["id"] for e in s.endpoints()] == ["e2"]
     assert s.save_endpoint({"model": "m"})["id"] == "e3"  # never reused: a resumed session can't change machines
+
+
+def test_an_endpoint_says_what_work_its_sessions_get(tmp_path):
+    """A big model on a GPU box in the house would count as "local" (the smallest functions, of which few are left):
+    its endpoint can say "small" (or more) instead."""
+    s = Settings(tmp_path / "settings.json")
+    lan = lambda base, resolve=False: True  # noqa: E731
+    e = s.save_endpoint({"provider": "llamacpp", "base_url": "http://192.168.1.118:8080/v1", "model": "dirk",
+                         "tier": "Small"})
+    assert e["tier"] == "small" and tiers.detect("api", _session_options(e), lan) == "small"
+    s.save_endpoint({"id": e["id"], "name": "A6000"})  # saving other fields keeps it
+    assert s.endpoint(e["id"])["tier"] == "small"
+    s.save_endpoint({"id": e["id"], "tier": ""})
+    assert "tier" not in s.endpoint(e["id"]) and tiers.detect("api", _session_options(s.endpoint(e["id"])), lan) == "local"
+    with pytest.raises(ValueError):
+        s.save_endpoint({"model": "x", "tier": "huge"})
+    assert len(s.endpoints()) == 1
 
 
 def fake_manager(*running: tuple[str, str]):

@@ -55,6 +55,15 @@ PERMUTER_TURNS = 3
 # Agents that claimed, released or matched something this recently count as working (for the division of labour).
 ACTIVE_WINDOW = 20 * 60
 LEAVE_FOR = ("permuter", "human")
+# A brief must fit in one tool result: the biggest functions' assembly alone ran to 76,000 characters, more than an
+# agent can receive, so they were released untried. Long assembly comes in pages (get_function page=N), and the
+# parts that can grow without bound are capped (the whole best attempt: get_function page=-1).
+ASM_PAGE_LINES = 450
+BRIEF_SOURCE_MAX = 12000
+BRIEF_NOTE_MAX = 700
+# A note that starts with this is the function's status digest: the latest one heads its brief, so an agent sees
+# what's been tried and what to try next without reading dozens of notes.
+DIGEST = "DIGEST:"
 
 
 class NetworkError(Exception):
@@ -522,8 +531,32 @@ class Network:
         return (f"Released {fn['name']}. Your best attempt and notes are saved so the next agent starts "
                 f"where you left off.{left.get(leave_for, '')}{refused} Call claim_function for a new one.")
 
-    def get_function(self, function: str, project: str | None = None, agent: Agent | None = None) -> str:
-        return self._brief(self._function(function, project), agent, header="VIEW")
+    def get_function(self, function: str, project: str | None = None, agent: Agent | None = None,
+                     page: int = 0) -> str:
+        """The function's brief (page 0), one page of its target assembly (page 1, 2, ...), or its whole best attempt
+        or machine draft (page -1)."""
+        fn = self._function(function, project)
+        proj = self.store.one("SELECT * FROM projects WHERE id=?", fn["project_id"])
+        if not page or self._hash_only(fn) or json.loads(proj["config"] or "{}").get("kind") == "fork":
+            return self._brief(fn, agent, header="VIEW")
+        if page < 0:
+            src = (fn["best_source"] or fn["seed"] or "").strip()
+            if not src:
+                return f"{fn['name']} has no attempt or machine draft yet."
+            what = f"best attempt, score {fn['best_score']}" if fn["best_source"] else "machine draft"
+            return f"## {fn['name']}: {what}\n```c\n{src}\n```"
+        asm = scoring.compact_asm(self._asm_text(fn, proj)).splitlines()
+        pages = max(1, -(-len(asm) // ASM_PAGE_LINES))
+        if page > pages:
+            raise NetworkError(f"{fn['name']}'s assembly has {pages} page{'s' if pages != 1 else ''}")
+        first = (page - 1) * ASM_PAGE_LINES
+        chunk = asm[first:first + ASM_PAGE_LINES]
+        return (f"## {fn['name']}: target assembly, page {page} of {pages} (lines {first + 1}-{first + len(chunk)} "
+                f"of {len(asm)})\n```asm\n" + "\n".join(chunk) + "\n```")
+
+    def _clip(self, text: str, limit: int, rest: str) -> str:
+        text = text.strip()
+        return text if len(text) <= limit else text[:limit].rstrip() + f"\n... ({len(text) - limit:,} more characters: {rest})"
 
     def _brief(self, fn, agent: Agent | None, header: str) -> str:
         proj = self.store.one("SELECT * FROM projects WHERE id=?", fn["project_id"])
@@ -536,6 +569,14 @@ class Network:
             who = "you" if agent and claim["agent_id"] == agent.id else self._agent_name(claim["agent_id"])
             lines.append(f"claimed by {who}, lease expires in {int(claim['expires_at'] - time.time()) // 60} min "
                          f"(each compile_and_diff renews it)")
+        digest = self.store.one(
+            "SELECT n.text, n.created_at, a.name FROM notes n LEFT JOIN agents a ON a.id=n.agent_id "
+            "WHERE n.function_id=? AND n.text LIKE ? ORDER BY n.id DESC LIMIT 1", fn["id"], DIGEST + "%")
+        if digest and fn["status"] != "matched":
+            lines += ["", f"### Status digest ({digest['name'] or 'review'}, {_ago(digest['created_at'])}): what's been "
+                          "tried and what to try next. Keep it current: add_note with this function and a text that "
+                          f"starts with {DIGEST}",
+                      self._clip(digest["text"][len(DIGEST):], 2 * BRIEF_NOTE_MAX, "the rest is in search_notes")]
         if fn["status"] == "matched":
             lines += [f"MATCHED by {self._agent_name(fn['matched_agent_id'])} {_ago(fn['matched_at'])}:",
                       "```c", fn["matched_source"].strip(), "```"]
@@ -544,28 +585,41 @@ class Network:
                       "each function, never its code. Disassemble your own lawful copy with "
                       f"`decompnet local asm <your-object.o> {fn['name']}` and diff locally with `decompnet local diff`."]
         else:
-            lines += ["", "### Target assembly", "```asm", scoring.compact_asm(self._asm_text(fn, proj)), "```"]
+            asm = scoring.compact_asm(self._asm_text(fn, proj)).splitlines()
+            pages = max(1, -(-len(asm) // ASM_PAGE_LINES))
+            lines += ["", "### Target assembly" + (f" (page 1 of {pages})" if pages > 1 else ""), "```asm",
+                      *asm[:ASM_PAGE_LINES], "```"]
+            if pages > 1:
+                lines.append(f"(the assembly continues: {len(asm) - ASM_PAGE_LINES} more lines. Read them with "
+                             f"get_function(function=\"{fn['name']}\", page=2) up to page={pages}, one page at a time "
+                             "as you write that part)")
         lines += self._extra_brief(fn, proj)
         if fn["status"] != "matched":
             if fn["best_source"]:
                 lines += ["", f"### Best attempt so far: score {fn['best_score']} by "
                               f"{self._agent_name(fn['best_agent_id'])} ({fn['attempts']} attempts total) — "
-                              f"start from this", "```c", fn["best_source"].strip(), "```"]
+                              f"start from this", "```c",
+                          self._clip(fn["best_source"], BRIEF_SOURCE_MAX, "get_function with page=-1 shows all of it"),
+                          "```"]
             elif fn["seed"]:
                 lines += ["", "### Machine-generated starting point (m2c: expect wrong types and names; "
                               "the context header helps)", "```c",
-                          fn["seed"].strip(), "```"]
+                          self._clip(fn["seed"], BRIEF_SOURCE_MAX, "get_function with page=-1 shows all of it"), "```"]
         notes = self.store.all(
             "SELECT n.text, n.created_at, a.name FROM notes n LEFT JOIN agents a ON a.id=n.agent_id "
-            "WHERE n.function_id=? ORDER BY n.id DESC LIMIT 8", fn["id"])
+            "WHERE n.function_id=? AND n.text NOT LIKE ? ORDER BY n.id DESC LIMIT 8", fn["id"], DIGEST + "%")
         if notes:
-            lines += ["", "### Notes from previous agents on this function"]
-            lines += [f"- ({n['name']}, {_ago(n['created_at'])}) {n['text']}" for n in notes]
+            lines += ["", "### Notes from previous agents on this function (latest first)"]
+            lines += [f"- ({n['name']}, {_ago(n['created_at'])}) "
+                      + self._clip(" ".join(n["text"].split()), BRIEF_NOTE_MAX, "search_notes has the full note")
+                      for n in notes]
         pnotes = self.store.all(
             "SELECT n.text, a.name FROM notes n LEFT JOIN agents a ON a.id=n.agent_id "
             "WHERE n.project_id=? AND n.function_id IS NULL ORDER BY n.id DESC LIMIT 5", proj["id"])
         if pnotes:
-            lines += ["", "### Project-wide notes (latest)"] + [f"- ({n['name']}) {n['text']}" for n in pnotes]
+            lines += ["", "### Project-wide notes (latest)"] + [
+                f"- ({n['name']}) " + self._clip(" ".join(n["text"].split()), 400, "search_notes has the full note")
+                for n in pnotes]
         if fn["unit"] and fn["unit"] in self._unit_contexts(proj["id"]):
             lines.insert(2, f"source unit {fn['unit']}: call get_context with function=\"{fn['name']}\" for its header")
         if header == "CLAIMED":
@@ -663,7 +717,8 @@ class Network:
                          "may be a tool problem: release_function with leave_for=\"human\" and say what you checked.")
             elif kind == "regalloc":
                 head += ("\nOnly registers, instruction order or stack offsets differ: the permuter's job. Unless you "
-                         "see a concrete fix, release_function with leave_for=\"permuter\" and claim the next one.")
+                         "see a concrete fix (a pin from context.h on the register that differs often is one), "
+                         "release_function with leave_for=\"permuter\" and claim the next one.")
         warn = f"\ncompiler output:\n{result.log.strip()}" if result.log.strip() else ""
         if problems:
             warn += "\nwhen linking your code at the function's address:\n" + "\n".join(f"- {p}" for p in problems)

@@ -1631,6 +1631,9 @@ function renderLauncher(box, compact = false) {
 /* API endpoints: OpenAI-compatible servers (DeepSeek, a llama.cpp box on the network...), each with its own address,
    model and key. The same fields in the launcher and on the Agents & models page. */
 function hostOf(url) { return String(url || "").replace(/^\w+:\/\//, "").split("/")[0]; }
+// what an endpoint's sessions get (tiers.py): a model on your own network otherwise counts as "local"
+const TIER_CHOICES = [["", "from the model"], ["local", "local: up to 40 instructions"], ["small", "small: up to 80"],
+  ["medium", "medium: up to 250"], ["large", "large: anything"]];
 function endpointFields(e, compact = false) {
   const presets = S.st.api_presets, prov = presets[e.provider] ? e.provider : "custom";
   return `<label class="field"><span>Provider</span><select data-f="prov">${Object.entries(presets).map(([k, p]) => `<option value="${k}" ${k === prov ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>
@@ -1639,7 +1642,8 @@ function endpointFields(e, compact = false) {
     <label class="field wide"><span>API key (stored only on this computer, sent only to this address)</span><input data-f="key" type="password" placeholder="${e.has_key ? esc(e.api_key) : "paste your key (none for local models)"}" autocomplete="off"></label>
     ${compact ? "" : `<label class="field"><span>Name</span><input data-f="name" value="${esc(e.id ? e.name : "")}" placeholder="${esc(e.id ? e.name : "e.g. gpu-box")}"></label>
     <label class="field"><span>Context size (tokens)</span><input data-f="ctx" class="mono" inputmode="numeric" placeholder="automatic" value="${esc(String(e.context_tokens || ""))}"></label>
-    <label class="field"><span>Sessions at once</span><input data-f="max" class="mono" inputmode="numeric" placeholder="no limit" value="${esc(String(e.max_sessions || ""))}"></label>`}`;
+    <label class="field"><span>Sessions at once</span><input data-f="max" class="mono" inputmode="numeric" placeholder="no limit" value="${esc(String(e.max_sessions || ""))}"></label>
+    <label class="field"><span>Work it gets</span><select data-f="tier">${TIER_CHOICES.map(([v, l]) => `<option value="${v}" ${v === (e.tier || "") ? "selected" : ""}>${l}</option>`).join("")}</select></label>`}`;
 }
 function wireEndpointFields(box) {
   box.querySelectorAll('[data-f="prov"]').forEach((sel) => {
@@ -1654,7 +1658,7 @@ function endpointData(scope, id = "") {
   const f = (k) => scope.querySelector(`[data-f="${k}"]`);
   const out = { provider: f("prov").value, base_url: f("base").value, model: f("model").value, api_key: f("key").value };
   if (id) out.id = id;
-  if (f("name")) Object.assign(out, { name: f("name").value, context_tokens: f("ctx").value, max_sessions: f("max").value });
+  if (f("name")) Object.assign(out, { name: f("name").value, context_tokens: f("ctx").value, max_sessions: f("max").value, tier: f("tier").value });
   return out;
 }
 

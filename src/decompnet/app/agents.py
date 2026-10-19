@@ -775,13 +775,16 @@ class Manager:
                 "ido" if ov["compiler"]["toolchain"].startswith("ido") else "gcc-kmc")]
         text += "\nKnow-how you'd otherwise read with guide() (more topics: guide()):\n\n" + "\n\n".join(
             tools._guide(t) for t in topics)
-        if (learned := self.net.learnings(s.slug)):
-            text += ("\nWhat agents learned on this project so far (compiler quirks, conventions; add yours with "
-                     f"add_note and no function):\n{learned}\n")
+        # what stays the same from session to session first, what changes last: a prompt that starts exactly like the
+        # last one is read from the model server's cache (Claude's prompt cache; a local model's prefix cache, which
+        # for hybrid models like Qwen 3.8 only works when the new prompt continues the cached one exactly)
         if (wish := self.net.instructions(s.slug)):
             text += f"\nThe user's instructions for this project (they come first):\n{wish}\n"
         if (t := tiers.get(tiers.detect(s.kind, s.options, is_local))) is not None:
             text += f"\nYour role here ({t.name} model; claim_function picks functions that suit it):\n{t.guidance}\n"
+        if (learned := self.net.learnings(s.slug)):
+            text += ("\nThe newest project notes (add yours with add_note and no function"
+                     + ("; the essentials are in the user's instructions above" if wish else "") + f"):\n{learned}\n")
         return text
 
     def _per_session(self, s: Session) -> int:
@@ -1076,7 +1079,9 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
                            "notes and a draft. count > 1: a batch of small functions to judge together.",
                            s(function=st("optional name or address"), strategy=st("finish | easiest | closest | hardest | random"),
                              count=it("up to 6 small functions at once"))),
-        "get_function": ("Show any function by name or address.", s(function=st("name or address", True))),
+        "get_function": ("Show any function by name or address. page: 1, 2, ... for more of a long function's assembly; "
+                         "-1 for its whole best attempt or draft.",
+                         s(function=st("name or address", True), page=it("0 = brief (default)"))),
         "compile_and_diff": ("Compile C for the function, link it at its address and diff against the ROM. "
                              "Score 0 = matched. Several functions: names comma-separated, all definitions in source.",
                              s(function=st("function name, or several: a, b, c", True), source=st("C source", True))),

@@ -30,7 +30,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .. import __version__, hostenv, toolchains
+from .. import __version__, hostenv, tiers, toolchains
 from ..network import NetworkError
 from ..rom.n64 import RomError
 from . import agents, chat, collab, connect, tools, updates
@@ -160,6 +160,11 @@ class Settings:
                 except ValueError:
                     raise ValueError("the context size is a number of tokens, like 16384" if k == "context_tokens"
                                      else "the session limit is a number, like 1") from None
+        # the work its sessions get (tiers.py). Empty: decided by the model and the address, and a model on your own
+        # network counts as "local" (the smallest functions), too little for a big model on a GPU
+        tier = str(data["tier"] or "").strip().lower() if "tier" in data else None
+        if tier and tier not in tiers.TIERS:
+            raise ValueError(f"the work it gets is one of {', '.join(tiers.ORDER)}, or empty (from the model)")
         current = self.endpoint(str(data.get("id") or ""))
         if current is None:  # ids are never reused: a session resumed later can't end up on another machine
             ids = {e["id"] for e in self.endpoints()}
@@ -177,6 +182,10 @@ class Settings:
                 current[k] = max(2048, n) if k == "context_tokens" else max(1, min(n, 32))
             else:
                 current.pop(k, None)
+        if tier:
+            current["tier"] = tier
+        elif tier is not None:
+            current.pop("tier", None)
         if data.get("api_key") and "•" not in str(data["api_key"]):
             current["api_key"] = str(data["api_key"]).strip()
         if data.get("clear_key"):
@@ -206,7 +215,7 @@ def _session_options(entry: dict) -> dict:
     """What a built-in agent session needs from its endpoint."""
     out = {"endpoint": entry.get("id") or "", "provider": entry["provider"], "base_url": entry["base_url"],
            "model": entry["model"], "provider_name": entry["name"]}
-    return out | {k: entry[k] for k in ("api_key", "context_tokens") if entry.get(k)}
+    return out | {k: entry[k] for k in ("api_key", "context_tokens", "tier") if entry.get(k)}
 
 
 def _spread(settings: Settings, manager, picked: list[str], count: int, given: dict) -> list[tuple[dict, int]]:

@@ -74,8 +74,9 @@ Use only the decomp tools. Repeat for up to {count} claims (a batch is one), the
 4. Score 0 = matched and saved. Before moving on, share what you learned: edit_context for prototypes and
    structs you worked out, rename_symbol for functions/data whose purpose is now clear, and add_note (no
    function) for a compiler quirk or convention every agent here should know: the next sessions start with it.
-5. compile_and_diff says when to move on (no better after a few compiles in a row; more for big functions):
-   then release_function with precise notes (what you tried, what is left) and claim the next one. Only
+5. compile_and_diff says when to move on (no better after a few compiles in a row; more for big functions).
+   Before you release, update the function's status digest: add_note with function set and a text like
+   "DIGEST: best 40; tried A, B; left: C; next: D". It heads the next agent's brief. Then release_function. Only
    registers or instruction order differ: release_function with leave_for="permuter". Every instruction matches
    but data still differs and you've checked your data: leave_for="human", saying what you checked.
 
@@ -180,7 +181,7 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "project_info": lambda net, agent, slug: project_info(net, slug),
     "claim_function": lambda net, agent, slug, function="", strategy="", count=1:
         _claim(net, agent, slug, function, strategy, count),
-    "get_function": lambda net, agent, slug, function: net.get_function(function, slug, agent),
+    "get_function": lambda net, agent, slug, function, page=0: net.get_function(function, slug, agent, int(page or 0)),
     "compile_and_diff": lambda net, agent, slug, function, source: _compile(net, agent, slug, function, source),
     "release_function": lambda net, agent, slug, function, notes, leave_for="":
         net.release(agent, function, notes, slug, leave_for),
@@ -280,10 +281,15 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]])
         return await run(ctx, "claim_function", function=function, strategy=strategy, count=count)
 
     @mcp.tool(meta=ALWAYS_LOAD)
-    async def get_function(ctx: Context, function: str) -> str:
+    async def get_function(ctx: Context, function: str, page: int = 0) -> str:
         """Show any function (by name or address): assembly, status, best attempt, notes. Read matched
-        functions to learn how this codebase is written."""
-        return await run(ctx, "get_function", function=function)
+        functions to learn how this codebase is written.
+
+        Args:
+            page: 0 for the brief; 1, 2, ... for one page of a long function's target assembly (the brief says
+                how many); -1 for the whole best attempt or machine draft when the brief cut it short
+        """
+        return await run(ctx, "get_function", function=function, page=page)
 
     @mcp.tool(meta=ALWAYS_LOAD)
     async def compile_and_diff(ctx: Context, function: str, source: str) -> str:
