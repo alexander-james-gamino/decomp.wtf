@@ -32,6 +32,7 @@ from .symbols import SymbolTable
 
 R_MIPS_32, R_MIPS_26, R_MIPS_HI16, R_MIPS_LO16, R_MIPS_GPREL16 = 2, 4, 5, 6, 7
 _REF = re.compile(r"%(hi|lo|gp_rel)\(\s*([A-Za-z_.$][\w.$]*)\s*(?:([+-])\s*(0x[0-9A-Fa-f]+|\d+))?\s*\)")
+_L_LABEL = re.compile(r"\.L([0-9A-Fa-f]{8})$")
 _KIND = {"hi": 5, "lo": 6, "gp_rel": 7}
 _JUMPS = {"jal", "j"}
 # Bytes a load or store moves, by opcode (lwl/lwr/swl/swr read parts of words, so they don't say)
@@ -133,6 +134,10 @@ def target_from_split(fn: RomFunction, resolve: Callable[[str], int | None], big
         if m:
             kind, sym, sign, num = m.groups()
             base = resolve(sym)
+            if base is None and (lab := _L_LABEL.match(sym)):
+                # splat names a disassembly's local labels after their address: .L80098F84 *is*
+                # 0x80098F84, but the symbol table doesn't list them (they're not data anyone can label)
+                base = int(lab.group(1), 16)
             if base is not None:
                 addend = (int(num, 0) if num else 0) * (-1 if sign == "-" else 1)
                 relocs.append((off, _KIND[kind], (base + addend) & 0xFFFFFFFF))
@@ -193,6 +198,7 @@ class _Linker:
         self.problems: list[str] = []
         self.local_map: dict[tuple[int, int], int] = {}  # (section index, offset) -> ROM address
         self.target_at = {off: (rtype, addr) for off, rtype, addr in target.relocs}
+        self._used: set[int] = set()  # ROM relocations a candidate reference already claimed
         self.data: dict[tuple[int, int], int] = {}  # every datum of its own the candidate uses -> ROM address
         self.widths: dict[tuple[int, int], int | None] = {}  # bytes the code loads from it (None: its address is used)
         self._data_relocs: dict[int, list] = {}
@@ -215,6 +221,22 @@ class _Linker:
             self.problem(f"`{name}` is not a known symbol. Use the name the assembly shows (like D_80012340 or "
                          f"func_80001234), or give that address this name first with rename_symbol.")
         return addr
+
+    def _place(self, r: dict, shndx: int, off: int) -> int | None:
+        """The ROM address a reference to this submission's own data loads: the relocation the original keeps
+        at the same instruction, or, when the compiler moved a switch's table references, one of the same type
+        still unused, in the original's order. One ROM relocation explains one candidate reference."""
+        want = self.target_at.get(r["off"])
+        if want is not None and want[0] == r["type"]:
+            self._used.add(r["off"])
+            return want[1]
+        free = sorted((o, a) for o, (t, a) in self.target_at.items() if t == r["type"] and o not in self._used)
+        prev = self.local_map.get((shndx, off))
+        taken = next((c for c in free if prev is None or c[1] == prev), free[0] if free else None)
+        if taken is None:
+            return None
+        self._used.add(taken[0])
+        return taken[1]
 
     def address(self, raw: list[dict], k: int, fn_shndx: int, fn_start: int) -> int | None:
         r = raw[k]
@@ -248,12 +270,12 @@ class _Linker:
         if base is not None:
             addr = base + named[1]
         else:
-            want = self.target_at.get(r["off"])
-            if want is None or want[0] != r["type"]:
+            placed = self._place(r, shndx, off)
+            if placed is None:
                 label = f"{named[0]}+0x{named[1]:X}" if named else f"{self.elf.get_section(shndx).name}+0x{off:X}"
                 self.problem(f"your code refers to {label} where the ROM's code has no address")
                 return None
-            addr = want[1]
+            addr = placed
             prev = self.local_map.setdefault((shndx, off), addr)
             if prev != addr:
                 self.problem(f"{self.elf.get_section(shndx).name}+0x{off:X} is used for two different ROM addresses")
