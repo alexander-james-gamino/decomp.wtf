@@ -223,6 +223,41 @@ def render_rows(rows: list[tuple[str, str, str]], context: int = 2, max_rows: in
     return (f"{summary}\n" if summary else "") + legend + "\n" + "\n".join(lines)
 
 
+def section_report(rows: list[tuple[str, str, str]], vram: int, labels: list[int], min_insns: int = 90) -> str:
+    """Where a big function's attempt stands, section by section, and whether its calls line up. Sections are cut at
+    the target's own branch labels (at least `min_insns` instructions each). Whole-function scores hide progress on
+    a function with a thousand instructions: this shows which parts already read the same and where to look next.
+    exact: the same instruction; close: same opcode, other registers/offsets/order; wrong: another instruction or
+    one only the target has."""
+    tgt = [(i, m, t, c) for i, (m, t, c) in enumerate(rows) if t]
+    if not tgt:
+        return ""
+    cuts = [0]
+    for a in sorted(set(labels)):
+        k = (a - vram) // 4
+        if k - cuts[-1] >= min_insns and len(tgt) - k >= min_insns // 2:
+            cuts.append(k)
+    cuts.append(len(tgt))
+    lines = []
+    for lo, hi in zip(cuts, cuts[1:]):
+        part = tgt[lo:hi]
+        exact = sum(1 for _, m, _, _ in part if m == " ")
+        close = sum(1 for _, m, _, _ in part if m in "rsio")
+        first = next((lo + k for k, (_, m, _, _) in enumerate(part) if m != " "), None)
+        lines.append(f"  0x{vram + 4 * lo:08X}-0x{vram + 4 * hi - 4:08X} {hi - lo:4} insns: {exact} exact, {close} close, "
+                     f"{hi - lo - exact - close} wrong" + (f"; first difference at 0x{vram + 4 * first:08X}" if first is not None else ""))
+    calls_t = [(k, t.split()[1]) for k, (_, _, t, _) in enumerate(tgt) if t.startswith("jal ")]
+    calls_c = [c.split()[1] for _, _, c in rows if c.startswith("jal ")]
+    same = 0
+    while same < len(calls_t) and same < len(calls_c) and calls_t[same][1] == calls_c[same]:
+        same += 1
+    call_line = f"  calls: target {len(calls_t)}, yours {len(calls_c)}; the first {same} are the same"
+    if same < len(calls_t):
+        call_line += (f" (next in the target: {calls_t[same][1]} at 0x{vram + 4 * calls_t[same][0]:08X}, yours: "
+                      f"{calls_c[same] if same < len(calls_c) else 'none'})")
+    return "Sections of the target (a big function: fix the first section with a difference first):\n" + "\n".join(lines) + "\n" + call_line
+
+
 _SPLAT_PREFIX = re.compile(r"^/\*\s*[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+[0-9A-Fa-f]{8}\s*\*/\s*")
 
 

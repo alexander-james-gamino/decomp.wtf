@@ -56,6 +56,7 @@ STRATEGIES = {
 }
 # Runs of the permuter on a function that didn't match before it goes back to the agents (handoff cleared).
 PERMUTER_TURNS = 3
+BIG_INSNS = 300  # from this size on, compile_and_diff adds a section-by-section report (scoring.section_report)
 # Agents that claimed, released or matched something this recently count as working (for the division of labour).
 ACTIVE_WINDOW = 20 * 60
 LEAVE_FOR = ("permuter", "human")
@@ -755,7 +756,11 @@ class Network:
         warn = f"\ncompiler output:\n{result.log.strip()}" if result.log.strip() else ""
         if problems:
             warn += "\nwhen linking your code at the function's address:\n" + "\n".join(f"- {p}" for p in problems)
-        return {"text": f"{head}\n{d.render()}{warn}{self.stall_note(fn['id'], agent.id)}", "score": d.score, "matched": False}
+        sections = ""
+        if (fn["n_insns"] or 0) >= BIG_INSNS and fn["vram"] and d.rows:
+            labels = [int(m, 16) for m in re.findall(r"^\.L([0-9A-Fa-f]{8}):", fn["asm"] or "", re.M)]
+            sections = "\n" + scoring.section_report(d.rows, fn["vram"], labels)
+        return {"text": f"{head}{sections}\n{d.render()}{warn}{self.stall_note(fn['id'], agent.id)}", "score": d.score, "matched": False}
 
     def stall_note(self, function_id: int, agent_id: int, after: int | None = None) -> str:
         """A nudge once an agent's last `after` compiles of a function didn't beat its best: functions that match

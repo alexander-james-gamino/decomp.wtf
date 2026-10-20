@@ -284,3 +284,16 @@ def test_tiers_disabled_helper_gets_what_the_tiers_hold_back(tmp_path):
     free2, _ = net.local_agent("free2")
     net.set_agent_tier(free2.id, "any")
     assert net.claim_row(free2, "game", None, "easiest")["name"] == "handed"
+
+
+def test_big_function_sections_and_calls():
+    """compile_and_diff on a big function says which sections already match and where the calls stop agreeing."""
+    from decompnet import scoring
+
+    rows = [(" ", f"addiu $v0, $zero, {i}", f"addiu $v0, $zero, {i}") for i in range(10)]
+    rows += [("r", "move $s0, $a0", "move $s1, $a0"), (" ", "jal func_A", "jal func_A"),
+             ("|", "jal func_B", "jal func_C"), ("<", "nop", ""), (" ", "jr $ra", "jr $ra")]
+    text = scoring.section_report(rows, 0x80001000, [0x80001000 + 4 * 8], min_insns=5)
+    assert "0x80001000-0x8000101C" in text and "8 insns: 8 exact, 0 close, 0 wrong" in text
+    assert "first difference at 0x80001028" in text  # the `move` row
+    assert "calls: target 2, yours 2; the first 1 are the same (next in the target: func_B" in text
