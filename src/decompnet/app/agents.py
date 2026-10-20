@@ -673,7 +673,12 @@ class Manager:
         agent, token = self.net.local_agent(s.agent_name)
         self.assignments[agent.id] = s.slug
         tier = tiers.detect(s.kind, s.options, is_local)
-        self.net.set_agent_tier(agent.id, tier)  # what it's handed (tiers.py); None: everything, as before
+        unrouted = str(s.options.get("tier") or "").strip().lower() == "any"
+        # what it's handed (tiers.py); None: everything, as before; "any": tiers disabled for this helper (it may also
+        # be handed what was left for the permuter, and what it released lately)
+        self.net.set_agent_tier(agent.id, "any" if unrouted else tier)
+        if unrouted:
+            tier = None
         workdir = self.home / "agents" / s.id
         workdir.mkdir(parents=True, exist_ok=True)
         failures = throttles = 0

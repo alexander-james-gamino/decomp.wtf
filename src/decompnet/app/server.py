@@ -865,7 +865,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         data = await body(request)
         kind, slug = str(data.get("kind", "")), str(data.get("slug", ""))
         given = data.get("options") or {}
-        options = {k: v for k, v in given.items() if k in ("model", "per_session")}
+        options = {k: v for k, v in given.items() if k in ("model", "per_session", "tier") and (k != "tier" or v == "any")}
         options.setdefault("per_session", settings.data.get("per_session", agents.PER_SESSION))
         count = max(1, min(int(data.get("count", 1)), 8))
         picked: list[str] = []
@@ -881,7 +881,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
             return fail(e)
         # remembered, so the next start is one click; models typed in come back as suggestions
         model = str(options.get("model") or "")
-        settings.data["launcher"] = {"kind": kind, "model": model, "count": count} | ({"endpoints": picked} if picked else {})
+        settings.data["launcher"] = {"kind": kind, "model": model, "count": count, "notier": options.get("tier") == "any"} | ({"endpoints": picked} if picked else {})
         if model and kind != "api":
             recent = settings.data.setdefault("recent_models", {}).setdefault(kind, [])
             settings.data["recent_models"][kind] = [model] + [m for m in recent if m != model][:7]

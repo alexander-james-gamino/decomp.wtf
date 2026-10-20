@@ -318,7 +318,11 @@ class Network:
     def set_agent_tier(self, agent_id: int, tier: str | None) -> None:
         """What a helper's model can take on (tiers.detect); None: unknown, no routing."""
         with self.store.tx() as db:
-            db.execute("UPDATE agents SET tier=? WHERE id=?", (tier if tier in tiers.TIERS else None, agent_id))
+            db.execute("UPDATE agents SET tier=? WHERE id=?", (tier if tier in tiers.TIERS or tier == "any" else None, agent_id))
+
+    def unrouted(self, agent: Agent | int) -> bool:
+        """A helper started with tiers disabled: it may be handed any open function that isn't claimed."""
+        return self.tier_of(agent) == "any"
 
     def default_strategy(self, agent: Agent, project: str | None) -> str:
         """The claim order an agent gets when it doesn't ask for one: its tier's, else the usual."""
@@ -328,7 +332,7 @@ class Network:
     def _active_tiers(self, db, project_id: int, agent_id: int, now: float) -> set[str]:
         """Tiers of the other agents working on the project right now (holding a claim, or busy lately)."""
         rows = db.execute(
-            "SELECT DISTINCT a.tier FROM agents a WHERE a.tier IS NOT NULL AND a.id != ? AND a.id IN ("
+            "SELECT DISTINCT a.tier FROM agents a WHERE a.tier IS NOT NULL AND a.tier != 'any' AND a.id != ? AND a.id IN ("
             " SELECT c.agent_id FROM claims c JOIN functions f ON f.id=c.function_id WHERE f.project_id=?"
             " UNION SELECT e.agent_id FROM events e WHERE e.project_id=? AND e.created_at > ?)",
             (agent_id, project_id, project_id, now - ACTIVE_WINDOW)).fetchall()
@@ -342,6 +346,14 @@ class Network:
         permuter (the cheaper tiers never take them), and a tier above one that's working takes what that one
         can't (the ORDER BY prefix). relax: the size and give-up caps dropped (no stronger tier is around)."""
         t = tiers.get(self.tier_of(agent))
+        if self.unrouted(agent):
+            # tiers disabled: nothing is blocked; what was left for a human or the permuter, and what this agent
+            # released lately, comes after everything else
+            later = ("COALESCE(f.handoff, '') = 'human', COALESCE(f.handoff, '') = 'permuter', "
+                     f"f.name IN (SELECT detail FROM events WHERE project_id={int(proj['id'])} AND agent_id={int(agent.id)} "
+                     f"AND kind='release' AND created_at > {float(now - 12 * 3600)}), ")
+            return ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims)",
+                    [proj["id"]], later)
         where = ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims) "
                  "AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release') "
                  "AND f.handoff IS NULL")
@@ -421,6 +433,8 @@ class Network:
     def fits(self, agent: Agent, fn) -> bool:
         """Whether a function suits the agent's tier for an automatic claim (the user's priority list included)."""
         t = tiers.get(self.tier_of(agent))
+        if self.unrouted(agent):
+            return True
         if fn["handoff"]:
             return False
         if t is None or t.name == "large":

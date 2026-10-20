@@ -258,3 +258,29 @@ def test_notes_from_before_handoffs_hand_their_functions_to_the_permuter_once(tm
     store = Store(tmp_path / "app.db")
     hand = {r["name"]: r["handoff"] for r in store.all("SELECT name, handoff FROM functions")}
     assert hand == {"said_permuter": "permuter", "far_but_said": None, "no_attempt": None, "other_note": None}
+
+
+def test_tiers_disabled_helper_gets_what_the_tiers_hold_back(tmp_path):
+    """A helper started with tiers disabled ("any") takes big functions and ones left for the permuter, which a
+    small-tier helper never gets; what it released lately comes last."""
+    import json
+
+    from decompnet.app.engine import RomNetwork
+
+    net = RomNetwork(tmp_path / "app.db", tmp_path)
+    with net.store.tx() as db:
+        pid = db.execute("INSERT INTO projects(slug,name,description,arch,big_endian,root,config) VALUES(?,?,?,?,?,?,?)",
+                         ("game", "Game", "", "mips", 0, str(tmp_path), json.dumps({"kind": "rom"}))).lastrowid
+        for name, n, handoff in [("big", 400, None), ("handed", 20, "permuter")]:
+            db.execute("INSERT INTO functions(project_id,name,size,n_insns,status,unit,handoff) VALUES(?,?,?,?,?,?,?)",
+                       (pid, name, n * 4, n, "open", "a", handoff))
+    small, _ = net.local_agent("small")
+    net.set_agent_tier(small.id, "small")
+    assert net.left_for(small, "game") == 0
+    free, _ = net.local_agent("free")
+    net.set_agent_tier(free.id, "any")
+    assert net.left_for(free, "game") == 2
+    assert net.claim_row(free, "game", None, "easiest")["name"] == "big"  # the permuter's one comes after
+    free2, _ = net.local_agent("free2")
+    net.set_agent_tier(free2.id, "any")
+    assert net.claim_row(free2, "game", None, "easiest")["name"] == "handed"
