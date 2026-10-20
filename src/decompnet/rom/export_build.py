@@ -225,7 +225,21 @@ def linker_script(provides: dict[tuple[str, str], str], gaps: list[tuple[int, st
     labels = set()
     for path in (ROOT / "asm" / "data").glob("**/*.s"):
         labels.update(re.findall(r"\.word\s+\.L([0-9A-Fa-f]{8})\b", path.read_text(errors="replace", encoding="utf-8")))
+    # and code that branches into another function's label (hand-written assembly, a function split mid-way)
+    for path in (ROOT / "asm" / "nonmatchings").glob("**/*.s"):
+        text = path.read_text(errors="replace", encoding="utf-8")
+        here = set(re.findall(r"^\.L([0-9A-Fa-f]{8}):", text, re.M))
+        labels.update(set(re.findall(r"\.L([0-9A-Fa-f]{8})\b", text)) - here)
     lines += [f'".L{label}" = 0x{label};' for label in sorted(labels)]
+    # data the code refers to by its automatic name (D_800BBF50) that no data file defines and the project's symbol
+    # table doesn't know (in an overlay's unsplit data, say): its name spells out its address too
+    defined = set(B["symbols"])
+    for path in (ROOT / "asm" / "data").glob("**/*.s"):
+        defined.update(re.findall(r"^\s*(?:dlabel|glabel)\s+(\w+)", path.read_text(errors="replace", encoding="utf-8"), re.M))
+    wanted = set()
+    for path in [*(ROOT / "src").glob("**/*.c"), *(ROOT / "asm" / "nonmatchings").glob("**/*.s")]:
+        wanted.update(re.findall(r"\bD_([0-9A-F]{8})\b", path.read_text(errors="replace", encoding="utf-8")))
+    lines += [f"D_{a} = 0x{a};" for a in sorted(wanted) if f"D_{a}" not in defined]
     # the segment symbols splat projects use (start-up code clears .bss with them)
     image_size = (ROOT / B["image"]).stat().st_size
     for seg in B["segments"]:

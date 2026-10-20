@@ -752,7 +752,18 @@ function renderStats(ov) {
   renderHeader(ov);
   const pct = ov.bytes ? (100 * ov.matched_bytes) / ov.bytes : 0;
   $("pct").textContent = pctNum(pct);
-  $("pctSub").textContent = (ov.bytes ? `${bytes(ov.matched_bytes)} of ${bytes(ov.bytes)}` : "") + linkedText(ov) + (S.today ? ` · ${S.today} matched today` : "");
+  const counts = ov.bytes - (ov.asm_bytes || 0);  // without what's set aside (Sony SDK code, hand-written assembly)
+  $("pctSub").textContent = (ov.bytes ? `${bytes(ov.matched_bytes)} of ${bytes(ov.bytes)}` : "")
+    + (ov.asm_bytes && counts > 0 ? ` · ${pctNum((100 * ov.matched_bytes) / counts)}% of the code that counts `
+      + `(${bytes(ov.asm_bytes)} set aside: ${bytes(ov.sdk_bytes || 0)} Sony SDK, ${bytes(ov.asm_bytes - (ov.sdk_bytes || 0))} assembly)` : "")
+    + linkedText(ov) + (S.today ? ` · ${S.today} matched today` : "");
+  // the average function's completeness (its best attempt, matched ones as 100%): shows work that's nearly there
+  $("lgAsm").hidden = !(ov.asm_bytes - (ov.sdk_bytes || 0) > 0);
+  $("lgSdk").hidden = !(ov.sdk_bytes && counts > 0);
+  const avg = ov.avg_complete, avgw = ov.avg_complete_w;  // the second one weighs big functions more
+  $("pctSub2").hidden = avg == null;
+  if (avg != null)
+    $("pctSub2").textContent = `the average function is ${avg.toFixed(2)}% there${avgw != null ? ` · ${avgw.toFixed(2)}% weighted (by instructions)` : ""} (${ov.functions.toLocaleString()} functions)`;
   $("fnCount").textContent = `${ov.matched.toLocaleString()} / ${ov.functions.toLocaleString()}`;
   renderAutopilot(ov);
   renderPermuter(ov);
@@ -1280,7 +1291,7 @@ function cssColor(name) {
   return rgb;
 }
 function readColors() {
-  colors = { open: cssColor("--open"), tried: cssColor("--tried"), work: cssColor("--work"), match: cssColor("--match"), hi: cssColor("--match-hi"), ink: cssColor("--ink") };
+  colors = { open: cssColor("--open"), tried: cssColor("--tried"), work: cssColor("--work"), match: cssColor("--match"), hi: cssColor("--match-hi"), ink: cssColor("--ink"), sdk: cssColor("--sdk"), asm: cssColor("--asm") };
 }
 const mix = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
 const rgb = (c, a = 1) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
@@ -1328,7 +1339,8 @@ function applyAttempts(attempts) {
 
 function cellColor(f) {
   if (f.status === "matched") return [colors.match, 1];
-  if (f.status === "asm") return [colors.tried, 0.35];
+  if (f.status === "asm" && f.sdk) return [colors.sdk, 0.9];  // unmodified Sony SDK code: not decompiled
+  if (f.status === "asm") return [colors.asm, 0.9];  // hand-written assembly: no C compiles to it
   if (f.best != null) return [mix(colors.tried, colors.hi, Math.pow(pctOf(f.best, f.insns) || 0, 3)), 1];
   return [colors.open, 1];
 }
@@ -1444,8 +1456,9 @@ function renderNow(claims) {
     const sc = S.scores.get(c.name) || [];
     const p = pctOf(c.best_score, c.n_insns);
     const [sym, unit] = c.name.split(/@(.*)/s);  // a fork's symbol@file: the symbol first, the file after it
+    const hist = sc && sc.length ? ` title="${sc.slice(-6).reverse().map((x) => esc(`${clock(x.t)} · ${x.score == null ? "didn't compile" : x.score === 0 ? "byte-identical" : `score ${x.score}`}`)).join("\n")}${sc.length > 6 ? `\n…${sc.length - 6} more` : ""}"` : "";
     return `<div class="job" data-fn="${esc(c.name)}"><div class="job-top"><span class="job-name" title="${esc(c.name)}">${esc(sym)}${unit ? `<small>@${esc(unit)}</small>` : ""}</span><span class="job-who" title="${esc(c.agent)}">${esc(c.agent)}</span></div>
-      ${spark(sc)}<div class="job-foot"><span>${c.n_insns} insns · ${c.attempts} tries</span><b>${p == null ? reading(c) : pctText(p)}</b></div></div>`;
+      ${spark(sc)}<div class="job-foot"${hist}><span>${c.n_insns} insns · ${c.attempts} tries</span><b>${p == null ? reading(c) : pctText(p)}</b></div></div>`;
   }).join("");
   box.querySelectorAll(".job").forEach((j) => { j.onclick = () => openFn(j.dataset.fn); });
 }
@@ -1889,6 +1902,15 @@ async function refreshFn(first) {
     $("copySrc").onclick = () => navigator.clipboard.writeText($("fnEdit").value).then(() => toast("Copied."));
     renderFnChart(d);
     $("diffWhich").hidden = d.status === "matched" || S.ov.kind === "fork" || d.scores.filter((x) => x.score != null).length < 2;
+    const withScore = d.scores.filter((x) => x.score != null);  // hover info for each attempt on the diff view
+    if (withScore.length) {
+      const bestAt = withScore.reduce((a, b) => (b.score < a.score ? b : a));
+      const lastAt = d.scores[d.scores.length - 1];
+      document.querySelectorAll("#diffWhich [data-which]").forEach((b) => {
+        const at = b.dataset.which === "best" ? bestAt : lastAt;
+        if (at) b.title = `${at.agent ? esc(at.agent) : "you"} · ${clock(at.t)} · ${at.score === 0 ? "byte-identical" : `score ${at.score}`}`;
+      });
+    }
     const xr = [];
     if (d.calls.length) xr.push(`<div><b>calls</b>${d.calls.map(fnLink).join("")}</div>`);
     if (d.called_by.length) xr.push(`<div><b>called by</b>${d.called_by.map(fnLink).join("")}</div>`);
@@ -2098,11 +2120,13 @@ function renderList() {
   $("fnRows").innerHTML = rows.slice(0, L.limit).map((f) => {
     const st = fnState(f), p = pctOf(f.best, f.insns);
     const best = st === "matched" ? `<span class="ok">100%</span>` : p == null ? `<span class="dim">–</span>` : pctText(p);
-    const status = st === "matched" ? `<span class="st matched" title="${esc(f.matched_by ? "by " + f.matched_by : "")}">matched</span>` : st === "asm" ? `<span class="st" title="hand-written assembly: no C compiles to it">assembly</span>` : st === "working" ? `<span class="st working">${esc(f.agent || "working")}</span>`
+    const tries = f.attempts ? ` title="${f.attempts} compile${f.attempts === 1 ? "" : "s"}${f.best != null ? ` · best score ${f.best}` : ""
+      }${f.matched_by ? ` · matched by ${esc(f.matched_by)} ${clock(f.matched_at)}` : ""}${f.agent ? ` · ${esc(f.agent)} holds the claim now` : ""}"` : "";
+    const status = st === "matched" ? `<span class="st matched" title="${esc(f.matched_by ? "by " + f.matched_by : "")}">matched</span>` : st === "asm" ? (f.sdk ? `<span class="st sdk" title="${esc(f.sdk)}: unmodified Sony SDK code, replaced by a port, not decompiled">Sony SDK</span>` : `<span class="st asm" title="hand-written assembly: no C compiles to it">assembly</span>`) : st === "working" ? `<span class="st working">${esc(f.agent || "working")}</span>`
       : st === "tried" ? `<span class="st tried">tried</span>` : `<span class="st">to do</span>`;
     return `<tr data-fn="${esc(f.name)}" class="${S.fn === f.name ? "sel" : ""}" tabindex="0"><td class="mono dim">${fork ? esc(f.unit || "") : hex8(f.vram)}</td>
       <td class="mono name">${(S.ov && (S.ov.priority || []).includes(f.name)) ? `<span class="star" title="agents take it next">★</span>` : ""}${esc(f.name)}</td><td class="r mono">${f.insns.toLocaleString()}</td><td class="r mono">${best}</td>
-      <td class="r mono">${f.attempts || `<span class="dim">0</span>`}</td><td>${status}</td></tr>`;
+      <td class="r mono"${tries}>${f.attempts || `<span class="dim">0</span>`}</td><td>${status}</td></tr>`;
   }).join("") || `<tr class="none"><td colspan="6">No function matches${q ? ` “${esc(L.q)}”` : ""}.</td></tr>`;
   $("fnShown").textContent = rows.length > L.limit ? `${L.limit.toLocaleString()} of ${rows.length.toLocaleString()} shown` : plural(rows.length, "function");
   $("fnMore").hidden = rows.length <= L.limit;
@@ -2339,6 +2363,7 @@ function renderPermuter(ov) {
     if (o.threads != null) $("pmThr").value = o.threads;
     if (o.max_score) $("pmMax").value = o.max_score;
     if (o.functions) $("pmFns").value = o.functions;
+    if (o.forever != null) $("pmForever").checked = !!o.forever;
   }
   const running = pm.state === "running";
   box.classList.toggle("on", running);
@@ -2347,7 +2372,7 @@ function renderPermuter(ov) {
   const won = pm.matched ? ` · <span class="ok">${pm.matched} matched</span>` : "";
   if (running) {
     const o = pm.options || {};
-    $("pmTitle").innerHTML = `Permuter: ${pm.current ? `working on ${esc(pm.current)} (best ${pm.current_best})` : "picking the next close call"}${won}`;
+    $("pmTitle").innerHTML = `Permuter: ${pm.current ? `working on ${esc(pm.current)} (best ${pm.current_best})` : pm.idle ? "waiting for new close calls (looks again every 5 min)" : "picking the next close call"}${won}`;
     $("pmSub").textContent = `${pm.tried} of ${pm.total || "?"} close calls tried · ${o.minutes} min each, best score ≤ ${o.max_score}${o.functions ? ` · only ${o.functions}` : ""}. It holds each function, so agents work elsewhere.`;
     $("pmBar").firstElementChild.style.width = `${(100 * pm.tried) / Math.max(1, pm.total)}%`;
     $("pmBtn").textContent = "Stop";
@@ -2355,22 +2380,62 @@ function renderPermuter(ov) {
     const how = pm.state === "failed" ? "stopped with an error" : pm.state === "stopped" ? "stopped" : "finished";
     $("pmTitle").innerHTML = `Permuter ${how}${won}`;
     $("pmSub").textContent = pm.state === "failed" ? (pm.error || "")
-      : `${plural(pm.tried, "close call")} tried${pm.matched_names && pm.matched_names.length ? `: matched ${pm.matched_names.join(", ")}` : ""}. A function is tried again only after someone improves it.`;
+      : `${plural(pm.tried, "close call")} tried${pm.matched_names && pm.matched_names.length ? `: matched ${pm.matched_names.join(", ")}` : ""}. Each function gets up to 3 runs, then goes back to the agents.`;
     $("pmBtn").textContent = "Run again";
   } else {
     $("pmTitle").textContent = "Permuter for close calls";
     $("pmSub").textContent = "Runs decomp-permuter on functions whose C is right but registers or order differ: it holds each one, submits improvements through the judge and stops when none are left.";
     $("pmBtn").textContent = "Run permuter";
   }
+  renderRemotePermuters(pm);
   $("pmBtn").onclick = async () => {
     $("pmBtn").disabled = true;
     const opts = { minutes: Number($("pmMin").value) || 10, threads: Number($("pmThr").value) || 0,
-                   max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim() };
+                   max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim(), forever: $("pmForever").checked };
     try { localStorage.setItem(PM_KEY, JSON.stringify(opts)); } catch (e) { /* not kept: fine */ }
     try {
       S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: running ? "stop" : "start", ...opts } });
       renderPermuter(S.ov);
     } catch (e) { toast(esc(e.message), "err"); } finally { $("pmBtn").disabled = false; }
+  };
+}
+
+/* Permuter workers on other machines (SSH hosts set up with tools/permute/remote_setup.sh): one line each, so you
+   can see they're getting work, with their own Stop. */
+const PM_HOST_KEY = "permuterHost";
+function renderRemotePermuters(pm) {
+  const rem = pm.remotes || [];
+  if (!$("pmHost").dataset.init) {
+    $("pmHost").dataset.init = "1";
+    try { const h = JSON.parse(localStorage.getItem(PM_HOST_KEY) || "{}"); if (h.host) $("pmHost").value = h.host; if (h.threads != null) $("pmHostThr").value = h.threads; } catch (e) { /* defaults */ }
+  }
+  const line = (r) => {
+    const o = r.options || {};
+    const state = r.state === "running" ? (r.current ? `on ${esc(r.current)} (best ${r.current_best})` : r.idle ? "waiting for new close calls (looks again every 5 min)" : "picking the next close call")
+      : r.state === "failed" ? `<span class="err">stopped with an error: ${esc(r.error || "")}</span>` : esc(r.state || "");
+    const bar = r.state === "running" && r.total ? `<span class="upbar"><i style="width:${Math.min(100, (100 * r.tried) / r.total)}%"></i></span>` : "";
+    return `<li><b>${esc(r.host)}</b>${bar}<span>${state}</span><span class="muted">${r.tried} of ${r.total || "?"} tried${r.matched ? ` · <span class="ok">${r.matched} matched</span>` : ""}${o.threads ? ` · ${o.threads} threads` : ""}${o.forever ? " · keeps going" : ""}</span>`
+      + (r.state === "running" ? `<button class="link-btn" type="button" data-pm-stop="${esc(r.host)}">Stop</button>` : "") + "</li>";
+  };
+  $("pmWorkers").innerHTML = rem.map(line).join("");
+  $("pmWorkers").querySelectorAll("[data-pm-stop]").forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try { S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: "stop", remote: b.dataset.pmStop } }); renderPermuter(S.ov); }
+      catch (e) { toast(esc(e.message), "err"); }
+    };
+  });
+  $("pmHostBtn").onclick = async () => {
+    const host = $("pmHost").value.trim();
+    if (!host) { toast("Type the other machine's address first (set it up with tools/permute/remote_setup.sh).", "err"); return; }
+    const threads = Number($("pmHostThr").value) || 0;
+    try { localStorage.setItem(PM_HOST_KEY, JSON.stringify({ host, threads })); } catch (e) { /* not kept: fine */ }
+    $("pmHostBtn").disabled = true;
+    try {
+      S.ov = await api("/api/permuter", { method: "POST", body: { slug: S.slug, action: "start", remote: host, threads,
+        minutes: Number($("pmMin").value) || 10, max_score: Number($("pmMax").value) || 150, functions: $("pmFns").value.trim(), forever: $("pmForever").checked } });
+      renderPermuter(S.ov);
+    } catch (e) { toast(esc(e.message), "err"); } finally { $("pmHostBtn").disabled = false; }
   };
 }
 
@@ -2587,7 +2652,8 @@ async function showSettingsPage() {
   $("setAgents").innerHTML = `
     <label class="field"><span>Functions per agent session (a fresh session keeps the agent's context small)</span><input id="perSession" type="number" min="1" max="20" value="${st.settings.per_session}"></label>
     <label class="field"><span>Budget: stop helper agents when a project's agents have spent this much (US dollars, as the agents report it; 0 = no limit)</span><input id="budgetSet" type="number" min="0" step="0.5" value="${st.settings.budget_usd || 0}"></label>
-    <label class="check"><input type="checkbox" id="autopilotSet" ${st.settings.autopilot !== false ? "checked" : ""}><span><b>Autopilot after each import</b>: try every function's machine draft first, so free matches cost no agent time.</span></label>`;
+    <label class="check"><input type="checkbox" id="autopilotSet" ${st.settings.autopilot !== false ? "checked" : ""}><span><b>Autopilot after each import</b>: try every function's machine draft first, so free matches cost no agent time.</span></label>
+    <label class="check"><input type="checkbox" id="tiersSet" ${st.settings.model_tiers ? "checked" : ""}><span><b>Model tiers</b>: hand each helper functions that suit its model (Haiku gets the small ones, Opus the hard ones; a stronger model picks up what a weaker one leaves). Off: anything is fair game for every agent, and simpler ones may struggle on big functions.</span></label>`;
   const theme = savedTheme();
   $("setComputer").innerHTML = `
     <div class="field"><span>Appearance</span><div class="seg" id="themeSeg">${[["", "System"], ["light", "Light"], ["dark", "Dark"]].map(([k, l]) => `<button type="button" data-theme="${k}" class="${theme === k ? "on" : ""}">${l}</button>`).join("")}</div></div>
@@ -2621,6 +2687,11 @@ async function showSettingsPage() {
   const save = (body, msg) => api("/api/settings", { method: "POST", body }).then((s) => { S.st.settings = s; toast(msg); }).catch((e) => toast(esc(e.message), "err"));
   $("perSession").onchange = () => save({ per_session: Number($("perSession").value) }, "Saved.");
   $("autopilotSet").onchange = () => save({ autopilot: $("autopilotSet").checked }, "Saved.");
+  $("tiersSet").onchange = async () => {
+    const on = $("tiersSet").checked;
+    await save({ model_tiers: on }, on ? "Model tiers are on (new helper sessions pick up their tier)."
+                                      : "Model tiers are off: helpers already working keep going; everything is fair game.");
+  };
   $("budgetSet").onchange = () => save({ budget_usd: Number($("budgetSet").value) || 0 }, "Budget saved.");
 }
 

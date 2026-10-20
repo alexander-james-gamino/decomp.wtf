@@ -207,6 +207,7 @@ class Settings:
         return {"endpoints": eps, "api": eps[0] if eps else {},
                 "per_session": self.data.get("per_session", agents.PER_SESSION), "last_project": self.data.get("last_project"),
                 "autopilot": self.data.get("autopilot", True), "budget_usd": self.data.get("budget_usd") or 0,
+                "model_tiers": bool(self.data.get("model_tiers", False)),
                 "auto_update": bool(self.data.get("auto_update")), "check_updates": self.data.get("check_updates", True) is not False,
                 "launcher": _launcher(self.data.get("launcher") or {}), "recent_models": self.data.get("recent_models") or {}}
 
@@ -272,6 +273,8 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
     jobs = Jobs(home / "logs" / "decomp.log")
     settings = Settings(home / "settings.json")
     manager.budget = lambda: float(settings.data.get("budget_usd") or 0)
+    manager.tiers_on = lambda: bool(settings.data.get("model_tiers", False))
+    net.routing_on = manager.tiers_on  # off: no tiers, no handoff or release blocks in the claim queue
 
     def remember(running: list[dict]) -> None:
         settings.data["running_agents"] = running
@@ -498,7 +501,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
             return {"slug": slug}
         return JSONResponse({"job": jobs.start("import", work)})
 
-    MAP_KEYS = ("name", "vram", "size", "insns", "unit", "status", "best", "attempts", "agent", "matched_at", "matched_by")
+    MAP_KEYS = ("name", "vram", "size", "insns", "unit", "status", "best", "attempts", "agent", "matched_at", "matched_by", "sdk")
 
     @mcp.custom_route("/api/map", methods=["GET"])
     async def api_map(request: Request) -> Response:
@@ -651,9 +654,9 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
     def p_permuter(slug, request, data):
         """The Permuter button: a project's own worker (decomp-permuter) with the options shown next to it."""
         if data.get("action") == "stop":
-            net.permuter.stop(slug)
+            net.permuter.stop(slug, str(data.get("remote") or ""))
         else:
-            opts = {k: data.get(k) for k in ("minutes", "threads", "max_score", "functions")}
+            opts = {k: data.get(k) for k in ("minutes", "threads", "max_score", "functions", "remote", "forever")}
             if net.permuter.start(slug, opts, manual=True) is None:
                 raise ValueError("this project has no permuter worker (tools/permute/dp_worker.py)")
         return net.overview(slug)
@@ -959,6 +962,11 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
             settings.data["per_session"] = max(1, min(int(data["per_session"]), 20))
         if "autopilot" in data:
             settings.data["autopilot"] = bool(data["autopilot"])
+        if "model_tiers" in data:
+            settings.data["model_tiers"] = bool(data["model_tiers"])
+            if not data["model_tiers"]:  # switching it off unroutes the helpers already working
+                with manager.net.store.tx() as db:
+                    db.execute("UPDATE agents SET tier=NULL")
         if "budget_usd" in data:
             settings.data["budget_usd"] = max(0.0, float(data["budget_usd"] or 0))
         if "auto_update" in data:

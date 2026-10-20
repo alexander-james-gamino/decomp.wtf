@@ -71,6 +71,7 @@ def test_the_session_prompt_keeps_what_changes_for_last():
 
     m = agents.Manager.__new__(agents.Manager)
     m.net = Net()
+    m.tiers_on = lambda: True  # the role text only appears when the Model tiers setting is on
     s = agents.Session("claude-1", "claude", "c", "game", "claude-1", {"model": "haiku"})
     prompt = agents.Manager.prompt(m, s)
     assert prompt.index("USER INSTRUCTIONS") < prompt.index("Your role here (small model") < prompt.index("NEWEST NOTE")

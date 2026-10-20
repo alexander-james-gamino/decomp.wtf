@@ -26,6 +26,10 @@ CLAIM_TTL = 30 * 60
 # A function an agent just released goes to the back of the queue for this long, for every agent: the next one
 # starts on something fresh instead of passing the same function back and forth. Asked for by name, it comes at once.
 RELEASE_COOLDOWN = 15 * 60
+# A function an agent released isn't handed back to that agent for this long (not forever: helpers keep one identity
+# for days, and once they had released everything left, they got "nothing left to claim" while 175 functions were
+# open). By then the shared header and the notes have usually moved on; asked for by name, it comes at once.
+RELEASE_RETRY = 12 * 3600
 MACHINE_AGENTS = ("autopilot", "permuter")  # decomp.wtf's own workers: their claims never mean "given up on"
 # Twins first (see app/twins.py): a function whose code the game has more than once (boost: how many more times)
 # and isn't too big or given up on, best value per instruction first; its twins (boost -1) last, as they match for
@@ -92,6 +96,9 @@ def _ago(ts: float | None) -> str:
 class Network:
     def __init__(self, db_path: str | Path, claim_ttl: int = CLAIM_TTL):
         self.store = Store(db_path)
+        # Model tiers / routing (the GUI's "Model tiers" setting; the app sets this). Off: every agent may be handed
+        # any open function that isn't claimed (permuter handoffs too), its own recent releases last, not blocked.
+        self.routing_on = lambda: True
         self.claim_ttl = claim_ttl
         self._pool = ThreadPoolExecutor(max_workers=8)
 
@@ -194,7 +201,8 @@ class Network:
 
     def _expire_claims(self, db) -> None:
         now = time.time()
-        own = {r["id"] for r in db.execute("SELECT id FROM agents WHERE name IN (?, ?)", MACHINE_AGENTS)}
+        own = {r["id"] for r in db.execute("SELECT id FROM agents WHERE name IN (?, ?) OR name LIKE 'permuter-%'",
+                                            MACHINE_AGENTS)}  # more permuter workers: permuter-2, ...
         for row in db.execute("SELECT c.function_id, c.agent_id, f.project_id, f.name FROM claims c "
                               "JOIN functions f ON f.id=c.function_id WHERE c.expires_at < ?", (now,)).fetchall():
             if row["agent_id"] in own:  # decomp.wtf's own tries (cut short by a restart): nobody gave up on it
@@ -341,7 +349,8 @@ class Network:
     def _eligible(self, db, agent: Agent, proj, now: float, relax: bool = False) -> tuple[str, list, str]:
         """(WHERE clause, its parameters, ORDER BY prefix) for what this agent may be handed automatically.
 
-        Everyone: open, unclaimed, not given up on by this agent, not left for the permuter or a human.
+        Everyone: open, unclaimed, not given up on by this agent lately (RELEASE_RETRY), not left for the
+        permuter or a human.
         By tier: what fits it (size, how often others gave up), register-allocation near misses wait for the
         permuter (the cheaper tiers never take them), and a tier above one that's working takes what that one
         can't (the ORDER BY prefix). relax: the size and give-up caps dropped (no stronger tier is around)."""
@@ -351,13 +360,23 @@ class Network:
             # released lately, comes after everything else
             later = ("COALESCE(f.handoff, '') = 'human', COALESCE(f.handoff, '') = 'permuter', "
                      f"f.name IN (SELECT detail FROM events WHERE project_id={int(proj['id'])} AND agent_id={int(agent.id)} "
-                     f"AND kind='release' AND created_at > {float(now - 12 * 3600)}), ")
+                     f"AND kind='release' AND created_at > {float(now - RELEASE_RETRY)}), ")
+            return ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims)",
+                    [proj["id"]], later)
+        if t is None and not self.routing_on():
+            # routing off: anything open and unclaimed; what this agent released lately comes after everything else
+            # nothing is blocked, but the permuter's work comes after the real work: functions left for the permuter
+            # or already 98%+ there (best score within 2% of n_insns * 100) last; within each, what this agent
+            # released lately after the rest
+            later = ("(COALESCE(f.handoff, '') = 'permuter' OR (f.best_score IS NOT NULL AND f.best_score <= f.n_insns * 2)), "
+                     f"f.name IN (SELECT detail FROM events WHERE project_id={int(proj['id'])} AND agent_id={int(agent.id)} "
+                     f"AND kind='release' AND created_at > {float(now - RELEASE_RETRY)}), ")
             return ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims)",
                     [proj["id"]], later)
         where = ("f.project_id=? AND f.status='open' AND f.id NOT IN (SELECT function_id FROM claims) "
-                 "AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release') "
-                 "AND f.handoff IS NULL")
-        params: list = [proj["id"], proj["id"], agent.id]
+                 "AND f.name NOT IN (SELECT detail FROM events WHERE project_id=? AND agent_id=? AND kind='release' "
+                 "AND created_at > ?) AND f.handoff IS NULL")
+        params: list = [proj["id"], proj["id"], agent.id, now - RELEASE_RETRY]
         prefix = ""
         if t is None:
             return where, params, prefix

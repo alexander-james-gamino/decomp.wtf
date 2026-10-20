@@ -22,7 +22,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -163,6 +165,10 @@ _NO_CREDIT = re.compile(r"insufficient[ _](?:balance|credits?|funds|quota)|excee
                         r"credit balance is too low|payment required|out of credits?", re.I)
 # and when it's asked too much at once (HTTP 429): it works again in a while
 _THROTTLED = re.compile(r"too many requests|rate[ _-]?limit|concurrency limit|\b429\b|overloaded", re.I)
+# and when the account has spent its plan's whole allowance (Claude Code: "5-hour limit reached · resets
+# 5:00pm"), or is asked to slow down in terms of minutes: it works again when the limit resets
+_USAGE_LIMIT = re.compile(r"limit reached|usage limit|will reset|resets? (?:at|in)\b|"
+                          r"(?:hit|reached|used|spent|expired)[^.]{0,40}limit", re.I)
 
 
 def no_credit(said: str) -> str | None:
@@ -171,6 +177,44 @@ def no_credit(said: str) -> str | None:
         return None
     return (f"the model's provider says the account is out of credit (\u201c{m.group(0)}\u201d): top it up, then "
             "start the agents again")
+
+
+def throttle_wait(said: str, now: float | None = None) -> int:
+    """How long the agent's output says a usage limit will last, in seconds ("5-hour limit reached · resets
+    5:00pm (America/New_York)", or "try again in 3m"): 60 when it announces a limit without saying when it
+    lifts, 0 when it says nothing."""
+    text = said[:4000]
+    if not _USAGE_LIMIT.search(text):
+        return 0
+    now = time.time() if now is None else now
+    if (m := re.search(r"\b(?:resets?|try again|retry)\s+in\s+(\d+)\s*([hms])\b", text, re.I)):
+        return int(m.group(1)) * {"h": 3600, "m": 60, "s": 1}[m.group(2).lower()]
+    m = re.search(r"\bresets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+                  r"(?:\s*\(([A-Za-z][\w/.+\-]*)\))?", text, re.I)
+    if not m:
+        return 60  # it announced the limit but not its end: check back briefly
+    hh, mm, ap, zone = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower(), m.group(4)
+    if hh > 23 or (ap and hh > 12):
+        return 60
+    if ap == "pm" and hh < 12:
+        hh += 12
+    if ap == "am" and hh == 12:  # "resets 12:00am": midnight, not noon
+        hh = 0
+    try:  # the zone in parentheses is the clock the reset time is announced in
+        tz = ZoneInfo(zone) if zone else None
+    except Exception:
+        tz = None
+    if tz is not None:  # relative to that zone's now: a time already past there means the next day
+        there = datetime.fromtimestamp(now, tz)
+        at = there.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if at <= there:
+            at += timedelta(days=1)
+        return min(round((at - there).total_seconds()), 12 * 3600) + 60
+    lt = time.localtime(now)
+    reset = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+    if reset <= now + 30:  # that time is past locally: the limit has already lifted, or it rolls over daily
+        return 120
+    return min(int(reset - now), 12 * 3600) + 60
 
 
 _versions: dict[str, tuple[float, str | None]] = {}
@@ -523,6 +567,7 @@ class Session:
     tokens: int = 0
     signed_out: bool = False  # the agent CLI isn't signed in: trying again won't help
     throttled: bool = False  # the last run ended on the provider's limit of requests at once: not a failure
+    throttle_wait: int = 0  # how long the provider says it will last, in seconds (0: unknown, try a minute)
 
     def push(self, kind: str, text: str) -> None:
         self.seq += 1
@@ -544,8 +589,15 @@ class Manager:
         self._prep: dict[str, threading.Event] = {}  # slug -> giving its code source files before agents claim
         self.on_stop = lambda: None  # set by the server: close tunnels when the app quits
         self.persist = lambda running: None  # set by the server: remember helpers to resume after a restart
+        self.tiers_on = lambda: False  # set by the server from the settings (the GUI toggle); off: no tier routing
 
     # -- control
+
+    def _tier(self, s: Session) -> tiers.Tier | None:
+        """This helper's tier (tiers.py) when model tiers are on; None when off: every helper can claim anything."""
+        if not self.tiers_on():
+            return None
+        return tiers.get(tiers.detect(s.kind, s.options, is_local))
 
     def start(self, kind: str, slug: str, count: int = 1, options: dict | None = None) -> list[str]:
         options = dict(options or {})
@@ -672,11 +724,11 @@ class Manager:
     def _run(self, s: Session) -> None:
         agent, token = self.net.local_agent(s.agent_name)
         self.assignments[agent.id] = s.slug
-        tier = tiers.detect(s.kind, s.options, is_local)
+        tier = self._tier(s)
         unrouted = str(s.options.get("tier") or "").strip().lower() == "any"
-        # what it's handed (tiers.py); None: everything, as before; "any": tiers disabled for this helper (it may also
+        # what it's handed (tiers.py); None: everything; "any": tiers disabled for this helper (it may also
         # be handed what was left for the permuter, and what it released lately)
-        self.net.set_agent_tier(agent.id, "any" if unrouted else tier)
+        self.net.set_agent_tier(agent.id, "any" if unrouted else (tier.name if tier else None))
         if unrouted:
             tier = None
         workdir = self.home / "agents" / s.id
@@ -738,11 +790,16 @@ class Manager:
                 s.state = "error"
                 break
             if s.throttled and throttles < 10:  # the provider's limit, not the agent's failure: wait it out
-                s.throttled, throttles = False, throttles + 1
+                wait, s.throttled, s.throttle_wait, throttles = max(1, s.throttle_wait or 60), False, 0, throttles + 1
                 s.state = "waiting"
-                s.push("info", "the model's provider says too many requests at once: trying again in a minute "
-                               "(fewer agents at once on this account would wait less)")
-                s.stop.wait(60)
+                if wait <= 60:
+                    s.push("info", "the model's provider says too many requests at once: trying again in a minute "
+                                   "(fewer agents at once on this account would wait less)")
+                else:
+                    until = f"{wait // 3600}h {(wait % 3600) // 60}min" if wait >= 3600 else f"~{wait // 60}min"
+                    s.push("info", f"the model's provider says the account's usage limit is spent: trying again "
+                                   f"when it resets (in {until})")
+                s.stop.wait(wait)
                 continue
             throttles = 0 if ok else throttles
             failures = 0 if ok else failures + 1
@@ -785,7 +842,7 @@ class Manager:
         # for hybrid models like Qwen 3.8 only works when the new prompt continues the cached one exactly)
         if (wish := self.net.instructions(s.slug)):
             text += f"\nThe user's instructions for this project (they come first):\n{wish}\n"
-        if (t := tiers.get(tiers.detect(s.kind, s.options, is_local))) is not None:
+        if (t := self._tier(s)) is not None:
             text += f"\nYour role here ({t.name} model; claim_function picks functions that suit it):\n{t.guidance}\n"
         if (learned := self.net.learnings(s.slug)):
             text += ("\nThe newest project notes (add yours with add_note and no function"
@@ -796,7 +853,7 @@ class Manager:
         """Claims per session: the helper's own setting, else its tier's (a local model: one), else the default."""
         if s.options.get("per_session"):
             return int(s.options["per_session"])
-        t = tiers.get(tiers.detect(s.kind, s.options, is_local))
+        t = self._tier(s)
         return t.per_session if t is not None else PER_SESSION
 
     def _prompt(self, s: Session) -> str:
@@ -887,6 +944,7 @@ class Manager:
             if not connect.status("antigravity"):  # decomp.wtf's tools only reach it through the user's settings
                 raise Fatal("Antigravity CLI only loads the MCP servers in your own settings: connect it to decomp.wtf "
                             "once (Connect your agent, or `decomp connect antigravity`), then start the helpers again")
+        s.throttle_wait = 0  # each run starts clean: only a limit announced in this run's output counts
         cmd, env, prompt = self._command(s, token, workdir)
         s.push("info", f"session {s.runs}: {KINDS[s.kind].name} started")
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if WIN else 0
@@ -935,6 +993,9 @@ class Manager:
             raise Fatal(why)  # every agent on this account fails the same way until it's topped up
         if code != 0 and not s.stop.is_set() and _THROTTLED.search(" ".join([*said, *errors])):
             s.throttled = True
+        if code != 0 and not s.stop.is_set() and (wait := throttle_wait(" ".join([*said, *errors]))):
+            s.throttled = True  # a usage limit ("5-hour limit reached"): not the agent's failure
+            s.throttle_wait = max(s.throttle_wait, wait)
         if code != 0 and not s.stop.is_set() and _SIGNED_OUT.search(" ".join([*said, *errors])):
             s.signed_out = True
             s.error = f"{KINDS[s.kind].name} isn't signed in on this computer. {signin(KINDS[s.kind])}"
@@ -962,11 +1023,13 @@ class Manager:
         model = s.options.get("model") or ""
         if not base or not model:
             raise RuntimeError("set the API address and model first")
+        s.throttle_wait = 0  # each run starts clean: only a limit announced in this run's output counts
         headers = {"Content-Type": "application/json"}
         if s.options.get("api_key"):
             headers["Authorization"] = f"Bearer {s.options['api_key']}"
         schema = api_tool_schemas(fork=bool(self.net.fork_slug(s.slug)))
-        if tiers.detect(s.kind, s.options, is_local) == "local":  # a small model stays on track with fewer tools
+        if (local := self._tier(s)) is not None and local.name == "local":
+            # a small model stays on track with fewer tools
             schema = [t for t in schema if t["function"]["name"] in LOCAL_TOOLS] or schema
         messages = [{"role": "system", "content": tools.INSTRUCTIONS},
                     {"role": "user", "content": self.prompt(s)}]
@@ -989,6 +1052,9 @@ class Manager:
                     if (why := no_credit(r.text)) or r.status_code == 402:
                         raise Fatal(why or no_credit("payment required"))
                     s.throttled = r.status_code == 429 or bool(_THROTTLED.search(r.text))
+                    wait = throttle_wait(r.text)
+                    if s.throttled or wait:
+                        s.throttled, s.throttle_wait = True, max(s.throttle_wait, wait)
                     s.error = f"API error {r.status_code}: {r.text[:300]}"
                     if _too_long(r):
                         s.error = ("the model's context is too small for this work even after trimming: give it at "

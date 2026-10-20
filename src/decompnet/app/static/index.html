@@ -204,6 +204,7 @@
         <span class="label">Matched code</span>
         <div class="big-row"><span class="num"><span id="pct">0</span><small>%</small></span><svg id="progress" class="progress" viewBox="0 0 200 44" preserveAspectRatio="none" aria-label="Matched code over time"></svg></div>
         <span class="sub" id="pctSub"></span>
+        <span class="sub" id="pctSub2" hidden></span>
       </div>
       <div class="kpi">
         <span class="label">Functions</span>
@@ -239,7 +240,14 @@
           <label title="Parallel permuter processes; 0 = all cores but two">Threads <input id="pmThr" type="number" min="0" max="128" value="0"></label>
           <label title="Only functions whose best score is at most this">Max score <input id="pmMax" type="number" min="1" max="1000000" value="150"></label>
           <label class="pm-fns" title="Comma-separated; empty = every close call">Only <input id="pmFns" placeholder="func_A, func_B (optional)"></label>
+          <label title="Never stop: when the queue is empty, go round again over near misses with longer runs; with nothing at all, look again every 5 minutes"><input type="checkbox" id="pmForever" checked> Keep going</label>
         </div>
+        <div class="pm-opts pm-remote" id="pmRemote">
+          <label title="An SSH host set up with tools/permute/remote_setup.sh: its CPU permutes, claims and judging stay here">Another machine <input id="pmHost" placeholder="192.168.1.118"></label>
+          <label title="Permuter processes there; 0 = all of that machine's cores">Threads there <input id="pmHostThr" type="number" min="0" max="256" value="0"></label>
+          <button class="ghost small-btn" id="pmHostBtn" type="button">Run there</button>
+        </div>
+        <ul class="pm-workers" id="pmWorkers"></ul>
       </div>
       <button class="ghost small-btn" id="pmBtn" type="button"></button>
     </div>
@@ -247,7 +255,7 @@
     <section class="panel map-panel">
       <header class="panel-head">
         <h2 id="mapTitle">ROM map</h2>
-        <div class="legend"><span><i class="sw open"></i>to do</span><span><i class="sw tried"></i>tried</span><span><i class="sw work"></i>working</span><span><i class="sw match"></i>matched</span></div>
+        <div class="legend"><span><i class="sw open"></i>to do</span><span><i class="sw tried"></i>tried</span><span><i class="sw work"></i>working</span><span><i class="sw match"></i>matched</span><span id="lgAsm" hidden><i class="sw asm"></i>assembly</span><span id="lgSdk" hidden><i class="sw sdk"></i>Sony SDK</span></div>
       </header>
       <p class="muted small map-hint" id="mapHint">every square is a function, in ROM order</p>
       <div class="map-wrap" id="mapWrap">
