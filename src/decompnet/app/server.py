@@ -30,7 +30,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .. import __version__, hostenv, tiers, toolchains
+from .. import __version__, hostenv, toolchains
 from ..network import NetworkError
 from ..rom.n64 import RomError
 from . import agents, chat, collab, connect, tools, updates
@@ -153,18 +153,18 @@ class Settings:
         """Add an endpoint (no id) or change one. A key is only replaced by a new one typed in (the masked one the
         GUI shows comes back unchanged)."""
         numbers = {}
-        for k in ("context_tokens", "max_sessions"):  # the model's context in tokens (empty = find out); a box's limit
+        # the model's context in tokens (empty = find out); a box's limit of sessions; the largest function its sessions
+        # are handed (empty = any size); how long a session waits for one reply (empty = the default)
+        why = {"context_tokens": "the context size is a number of tokens, like 16384",
+               "max_sessions": "the session limit is a number, like 1",
+               "max_insns": "the largest function is a number of instructions, like 80",
+               "reply_timeout": "the reply timeout is a number of seconds, like 900"}
+        for k in why:
             if k in data:
                 try:
                     numbers[k] = int(str(data[k] or "").strip() or 0)
                 except ValueError:
-                    raise ValueError("the context size is a number of tokens, like 16384" if k == "context_tokens"
-                                     else "the session limit is a number, like 1") from None
-        # the work its sessions get (tiers.py). Empty: decided by the model and the address, and a model on your own
-        # network counts as "local" (the smallest functions), too little for a big model on a GPU
-        tier = str(data["tier"] or "").strip().lower() if "tier" in data else None
-        if tier and tier not in tiers.TIERS:
-            raise ValueError(f"the work it gets is one of {', '.join(tiers.ORDER)}, or empty (from the model)")
+                    raise ValueError(why[k]) from None
         current = self.endpoint(str(data.get("id") or ""))
         if current is None:  # ids are never reused: a session resumed later can't end up on another machine
             ids = {e["id"] for e in self.endpoints()}
@@ -177,15 +177,14 @@ class Settings:
         for k in ("name", "provider", "base_url", "model"):
             if k in data:
                 current[k] = str(data[k] or "").strip()
+        limits = {"context_tokens": (2048, None), "max_sessions": (1, 32), "max_insns": (4, None), "reply_timeout": (30, 7200)}
         for k, n in numbers.items():
             if n:
-                current[k] = max(2048, n) if k == "context_tokens" else max(1, min(n, 32))
+                low, high = limits[k]
+                current[k] = max(low, n) if high is None else max(low, min(n, high))
             else:
                 current.pop(k, None)
-        if tier:
-            current["tier"] = tier
-        elif tier is not None:
-            current.pop("tier", None)
+        current.pop("tier", None)  # (model tiers are gone: the size limit replaces "Work it gets")
         if data.get("api_key") and "•" not in str(data["api_key"]):
             current["api_key"] = str(data["api_key"]).strip()
         if data.get("clear_key"):
@@ -207,7 +206,6 @@ class Settings:
         return {"endpoints": eps, "api": eps[0] if eps else {},
                 "per_session": self.data.get("per_session", agents.PER_SESSION), "last_project": self.data.get("last_project"),
                 "autopilot": self.data.get("autopilot", True), "budget_usd": self.data.get("budget_usd") or 0,
-                "model_tiers": bool(self.data.get("model_tiers", False)),
                 "auto_update": bool(self.data.get("auto_update")), "check_updates": self.data.get("check_updates", True) is not False,
                 "launcher": _launcher(self.data.get("launcher") or {}), "recent_models": self.data.get("recent_models") or {}}
 
@@ -216,7 +214,7 @@ def _session_options(entry: dict) -> dict:
     """What a built-in agent session needs from its endpoint."""
     out = {"endpoint": entry.get("id") or "", "provider": entry["provider"], "base_url": entry["base_url"],
            "model": entry["model"], "provider_name": entry["name"]}
-    return out | {k: entry[k] for k in ("api_key", "context_tokens", "tier") if entry.get(k)}
+    return out | {k: entry[k] for k in ("api_key", "context_tokens", "max_insns", "reply_timeout") if entry.get(k)}
 
 
 def _spread(settings: Settings, manager, picked: list[str], count: int, given: dict) -> list[tuple[dict, int]]:
@@ -273,8 +271,6 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
     jobs = Jobs(home / "logs" / "decomp.log")
     settings = Settings(home / "settings.json")
     manager.budget = lambda: float(settings.data.get("budget_usd") or 0)
-    manager.tiers_on = lambda: bool(settings.data.get("model_tiers", False))
-    net.routing_on = manager.tiers_on  # off: no tiers, no handoff or release blocks in the claim queue
 
     def remember(running: list[dict]) -> None:
         settings.data["running_agents"] = running
@@ -868,7 +864,7 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         data = await body(request)
         kind, slug = str(data.get("kind", "")), str(data.get("slug", ""))
         given = data.get("options") or {}
-        options = {k: v for k, v in given.items() if k in ("model", "per_session", "tier") and (k != "tier" or v == "any")}
+        options = {k: v for k, v in given.items() if k in ("model", "per_session", "max_insns") and v not in ("", None)}
         options.setdefault("per_session", settings.data.get("per_session", agents.PER_SESSION))
         count = max(1, min(int(data.get("count", 1)), 8))
         picked: list[str] = []
@@ -884,7 +880,8 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
             return fail(e)
         # remembered, so the next start is one click; models typed in come back as suggestions
         model = str(options.get("model") or "")
-        settings.data["launcher"] = {"kind": kind, "model": model, "count": count, "notier": options.get("tier") == "any"} | ({"endpoints": picked} if picked else {})
+        settings.data["launcher"] = ({"kind": kind, "model": model, "count": count, "max_insns": options.get("max_insns") or ""}
+                                     | ({"endpoints": picked} if picked else {}))
         if model and kind != "api":
             recent = settings.data.setdefault("recent_models", {}).setdefault(kind, [])
             settings.data["recent_models"][kind] = [model] + [m for m in recent if m != model][:7]
@@ -962,11 +959,6 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
             settings.data["per_session"] = max(1, min(int(data["per_session"]), 20))
         if "autopilot" in data:
             settings.data["autopilot"] = bool(data["autopilot"])
-        if "model_tiers" in data:
-            settings.data["model_tiers"] = bool(data["model_tiers"])
-            if not data["model_tiers"]:  # switching it off unroutes the helpers already working
-                with manager.net.store.tx() as db:
-                    db.execute("UPDATE agents SET tier=NULL")
         if "budget_usd" in data:
             settings.data["budget_usd"] = max(0.0, float(data["budget_usd"] or 0))
         if "auto_update" in data:

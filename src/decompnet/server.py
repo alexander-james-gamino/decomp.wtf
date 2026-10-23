@@ -12,7 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, RedirectResponse
 
 from . import jobs, policy, public
-from .network import STRATEGIES, Agent, Network, NetworkError
+from .network import STRATEGIES, WEIGHTED, Agent, Network, NetworkError
 from .registration import Registrar
 
 INSTRUCTIONS = """\
@@ -110,11 +110,12 @@ def build_server(net: Network, *, public_url: str, open_registration: bool = Fal
         Args:
             project: project slug (optional if the network has only one project)
             function: claim this specific function instead of letting the scheduler pick
-            strategy: how the scheduler picks: easiest (fewest instructions), closest (best existing attempt is
+            strategy: how the scheduler picks: shuffle (at random, weighted away from functions many agents
+                tried without progress), easiest (fewest instructions), closest (best existing attempt is
                 nearly matching - good for polishing), hardest, or random
         """
-        if strategy not in STRATEGIES:
-            raise ToolError(f"strategy must be one of {', '.join(STRATEGIES)}")
+        if strategy not in STRATEGIES and strategy not in WEIGHTED:
+            raise ToolError(f"strategy must be one of {', '.join([*WEIGHTED, *STRATEGIES])}")
         return await run(net.claim, agent_of(ctx), project, function, strategy)
 
     @mcp.tool()

@@ -1505,7 +1505,7 @@ $("stopAll").onclick = async () => {
 };
 
 /* ------------------------------------------------------------------ the launcher: agent, model, how many */
-const LZ = { kind: null, model: "", count: 1, per: null, notier: null };
+const LZ = { kind: null, model: "", count: 1, per: null, maxi: "" };
 function launcherInit() {
   if (LZ.kind || !S.st) return;
   const l = S.st.settings.launcher || {};
@@ -1514,7 +1514,7 @@ function launcherInit() {
   LZ.kind = known ? known.id : (ready[0] ? ready[0].id : "api");
   LZ.model = known ? (l.model || "") : "";
   LZ.count = l.count || 1;
-  LZ.notier = !!l.notier;
+  LZ.maxi = l.max_insns || "";
   const eps = S.st.settings.endpoints || [];
   LZ.eps = (l.endpoints || []).filter((id) => eps.some((e) => e.id === id));
   if (!LZ.eps.length && eps.length) LZ.eps = [eps[0].id];
@@ -1546,9 +1546,9 @@ async function startAgents(a, model, count, btn, extra = {}) {
     const options = { ...extra };
     if (model && a.id !== "api") options.model = model;
     if (LZ.per) options.per_session = LZ.per;
-    if (LZ.notier) options.tier = "any";
+    if (LZ.maxi) options.max_insns = LZ.maxi;
     await api("/api/agents/start", { method: "POST", body: { kind: a.id, slug: S.slug, count, options } });
-    S.st.settings.launcher = { kind: a.id, model: model || "", count, notier: !!LZ.notier };
+    S.st.settings.launcher = { kind: a.id, model: model || "", count, max_insns: LZ.maxi || "" };
     if (model && a.id !== "api") {
       const rec = (S.st.settings.recent_models ||= {});
       rec[a.id] = [model, ...(rec[a.id] || []).filter((m) => m !== model)].slice(0, 8);
@@ -1597,7 +1597,7 @@ function renderLauncher(box, compact = false) {
         ${compact ? "" : `<label class="field"><span>Functions per session</span><input data-f="per" type="number" min="1" max="20" value="${LZ.per || S.st.settings.per_session || 2}"></label>`}
         <span class="grow"></span>
         <button class="primary" data-act="start" type="button">${esc(launchLabel(a, LZ.model, LZ.count))}</button></div>
-        <label class="check inline"><input type="checkbox" data-f="notier" ${LZ.notier ? "checked" : ""}><span>Disable tiers: any model works on any open function<br><span class="muted small">Normally small models only get small functions and strong ones the hard rest.</span></span></label>
+        ${compact ? "" : `<label class="field"><span>Largest function (instructions; empty: any size)</span><input data-f="maxi" class="mono" inputmode="numeric" placeholder="any size" value="${esc(String(LZ.maxi || ""))}"></label>`}
         <p class="muted small">${a.id === "api" ? "A built-in agent loop drives the model through the decomp tools." : esc(a.signin)} Each agent takes a different function; a fresh session every few functions keeps its context small.</p>` : ""}
     </div>`;
   wireCopies(box);
@@ -1608,8 +1608,8 @@ function renderLauncher(box, compact = false) {
   if (sel) sel.onchange = () => { if (sel.value === "__other") { custom.hidden = false; custom.focus(); LZ.model = custom.value.trim(); } else { custom.hidden = true; LZ.model = sel.value; } label(); };
   if (custom) custom.oninput = () => { LZ.model = custom.value.trim(); label(); };
   box.querySelectorAll("[data-step]").forEach((b) => { b.onclick = () => { LZ.count = Math.max(1, Math.min(8, LZ.count + Number(b.dataset.step))); box.querySelector(".stepper output").textContent = LZ.count; label(); }; });
-  const notier = box.querySelector('[data-f="notier"]');
-  if (notier) notier.onchange = () => { LZ.notier = notier.checked; };
+  const maxi = box.querySelector('[data-f="maxi"]');
+  if (maxi) maxi.oninput = () => { LZ.maxi = maxi.value.trim(); };
   const per = box.querySelector('[data-f="per"]');
   if (per) per.onchange = () => { LZ.per = Math.max(1, Math.min(20, Number(per.value) || 4)); };
   wireEndpointFields(box);
@@ -1649,9 +1649,6 @@ function renderLauncher(box, compact = false) {
 /* API endpoints: OpenAI-compatible servers (DeepSeek, a llama.cpp box on the network...), each with its own address,
    model and key. The same fields in the launcher and on the Agents & models page. */
 function hostOf(url) { return String(url || "").replace(/^\w+:\/\//, "").split("/")[0]; }
-// what an endpoint's sessions get (tiers.py): a model on your own network otherwise counts as "local"
-const TIER_CHOICES = [["", "from the model"], ["local", "local: up to 40 instructions"], ["small", "small: up to 80"],
-  ["medium", "medium: up to 250"], ["large", "large: anything"]];
 function endpointFields(e, compact = false) {
   const presets = S.st.api_presets, prov = presets[e.provider] ? e.provider : "custom";
   return `<label class="field"><span>Provider</span><select data-f="prov">${Object.entries(presets).map(([k, p]) => `<option value="${k}" ${k === prov ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>
@@ -1661,7 +1658,8 @@ function endpointFields(e, compact = false) {
     ${compact ? "" : `<label class="field"><span>Name</span><input data-f="name" value="${esc(e.id ? e.name : "")}" placeholder="${esc(e.id ? e.name : "e.g. gpu-box")}"></label>
     <label class="field"><span>Context size (tokens)</span><input data-f="ctx" class="mono" inputmode="numeric" placeholder="automatic" value="${esc(String(e.context_tokens || ""))}"></label>
     <label class="field"><span>Sessions at once</span><input data-f="max" class="mono" inputmode="numeric" placeholder="no limit" value="${esc(String(e.max_sessions || ""))}"></label>
-    <label class="field"><span>Work it gets</span><select data-f="tier">${TIER_CHOICES.map(([v, l]) => `<option value="${v}" ${v === (e.tier || "") ? "selected" : ""}>${l}</option>`).join("")}</select></label>`}`;
+    <label class="field"><span>Largest function (instructions)</span><input data-f="maxi" class="mono" inputmode="numeric" placeholder="any size" value="${esc(String(e.max_insns || ""))}"></label>
+    <label class="field"><span>Reply timeout (seconds)</span><input data-f="rto" class="mono" inputmode="numeric" placeholder="900" value="${esc(String(e.reply_timeout || ""))}"></label>`}`;
 }
 function wireEndpointFields(box) {
   box.querySelectorAll('[data-f="prov"]').forEach((sel) => {
@@ -1676,7 +1674,7 @@ function endpointData(scope, id = "") {
   const f = (k) => scope.querySelector(`[data-f="${k}"]`);
   const out = { provider: f("prov").value, base_url: f("base").value, model: f("model").value, api_key: f("key").value };
   if (id) out.id = id;
-  if (f("name")) Object.assign(out, { name: f("name").value, context_tokens: f("ctx").value, max_sessions: f("max").value, tier: f("tier").value });
+  if (f("name")) Object.assign(out, { name: f("name").value, context_tokens: f("ctx").value, max_sessions: f("max").value, max_insns: f("maxi").value, reply_timeout: f("rto").value });
   return out;
 }
 
@@ -2652,8 +2650,7 @@ async function showSettingsPage() {
   $("setAgents").innerHTML = `
     <label class="field"><span>Functions per agent session (a fresh session keeps the agent's context small)</span><input id="perSession" type="number" min="1" max="20" value="${st.settings.per_session}"></label>
     <label class="field"><span>Budget: stop helper agents when a project's agents have spent this much (US dollars, as the agents report it; 0 = no limit)</span><input id="budgetSet" type="number" min="0" step="0.5" value="${st.settings.budget_usd || 0}"></label>
-    <label class="check"><input type="checkbox" id="autopilotSet" ${st.settings.autopilot !== false ? "checked" : ""}><span><b>Autopilot after each import</b>: try every function's machine draft first, so free matches cost no agent time.</span></label>
-    <label class="check"><input type="checkbox" id="tiersSet" ${st.settings.model_tiers ? "checked" : ""}><span><b>Model tiers</b>: hand each helper functions that suit its model (Haiku gets the small ones, Opus the hard ones; a stronger model picks up what a weaker one leaves). Off: anything is fair game for every agent, and simpler ones may struggle on big functions.</span></label>`;
+    <label class="check"><input type="checkbox" id="autopilotSet" ${st.settings.autopilot !== false ? "checked" : ""}><span><b>Autopilot after each import</b>: try every function's machine draft first, so free matches cost no agent time.</span></label>`;
   const theme = savedTheme();
   $("setComputer").innerHTML = `
     <div class="field"><span>Appearance</span><div class="seg" id="themeSeg">${[["", "System"], ["light", "Light"], ["dark", "Dark"]].map(([k, l]) => `<button type="button" data-theme="${k}" class="${theme === k ? "on" : ""}">${l}</button>`).join("")}</div></div>
@@ -2687,11 +2684,6 @@ async function showSettingsPage() {
   const save = (body, msg) => api("/api/settings", { method: "POST", body }).then((s) => { S.st.settings = s; toast(msg); }).catch((e) => toast(esc(e.message), "err"));
   $("perSession").onchange = () => save({ per_session: Number($("perSession").value) }, "Saved.");
   $("autopilotSet").onchange = () => save({ autopilot: $("autopilotSet").checked }, "Saved.");
-  $("tiersSet").onchange = async () => {
-    const on = $("tiersSet").checked;
-    await save({ model_tiers: on }, on ? "Model tiers are on (new helper sessions pick up their tier)."
-                                      : "Model tiers are off: helpers already working keep going; everything is fair game.");
-  };
   $("budgetSet").onchange = () => save({ budget_usd: Number($("budgetSet").value) || 0 }, "Budget saved.");
 }
 

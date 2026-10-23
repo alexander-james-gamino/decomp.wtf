@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from .. import network, scoring, seeds, similarity, tiers, toolchains
+from .. import network, scoring, seeds, similarity, toolchains
 from ..elfobj import FunctionObj
 from ..network import Agent, Network, NetworkError, _hash_token
 from ..rom import detect, match, split
@@ -910,6 +910,10 @@ class RomNetwork(Network):
             broken = self.regression_test(proj, None, sources=rewritten, only=renamed_rows, header_for=header_for)
         finally:
             self._sym_override.pop(proj["id"], None)
+        if broken:  # only what the rename itself breaks counts (see Network.already_failing)
+            already = self.already_failing(proj, matched)
+            gone = {r["name"] for r in renamed_rows if r["id"] in already}
+            broken = [(n, why) for n, why in broken if n not in gone]
         if broken:
             listing = "\n".join(f"- {n}: {why}" for n, why in broken[:10])
             return f"❌ REJECTED: renaming breaks {len(broken)} matched function(s).\n{listing}"
@@ -992,13 +996,11 @@ class RomNetwork(Network):
         fn = self.claim_row(agent, project, name, strategy)
         return self._brief(fn, agent, header="CLAIMED")
 
-    def claim_many(self, agent: Agent, project: str | None, count: int, strategy: str = "easiest") -> str:
+    def claim_many(self, agent: Agent, project: str | None, count: int, strategy: str = "shuffle") -> str:
         """Several small functions at once (count 2-6): the next one by `strategy` and, when it's small, its
         neighbours in the same file. Most small functions match on the first try, so an agent writes them all and
         judges them in one compile_and_diff: a fraction of the turns. Big functions come alone."""
         count = max(1, min(int(count or 1), 6))
-        if (t := tiers.get(self.tier_of(agent))) is not None:
-            count = min(count, t.batch)  # a local model gets one at a time; a large one, at most two
         if count == 1 or self._link(project) is not None:
             return self.claim(agent, project, None, strategy)
         proj = self._project(project)
@@ -1028,15 +1030,14 @@ class RomNetwork(Network):
     def _batch_more(self, agent: Agent, proj, first, n: int) -> list:
         """Up to n more small open functions next to `first` (same file, nearest address), claimed for the agent."""
         now = time.time()
-        t = tiers.get(self.tier_of(agent))
-        biggest = min(BATCH_INSNS, t.max_insns) if t is not None and t.max_insns is not None else BATCH_INSNS
+        limit = self.agent_limit(agent)
+        biggest = min(BATCH_INSNS, limit) if limit is not None else BATCH_INSNS
         with self.store.tx() as db:
             self._expire_claims(db)
             rows = db.execute(
                 "SELECT f.* FROM functions f WHERE f.project_id=? AND f.status='open' AND f.boost >= 0 AND f.n_insns <= ? "
                 "AND f.abandons = 0 AND f.unit=? AND f.id NOT IN (SELECT function_id FROM claims) "
-                + ("AND f.handoff IS NULL AND NOT (COALESCE(f.best_kind, '') = 'regalloc' AND f.best_score > 0) "
-                   if self.routing_on() else "") +
+                f"AND f.handoff IS NULL AND NOT {network.POOL} "
                 "ORDER BY ABS(COALESCE(f.vram, 0) - ?), f.id LIMIT ?",
                 (proj["id"], biggest, first["unit"], first["vram"] or 0, n)).fetchall()
             for r in rows:
@@ -1195,8 +1196,9 @@ class RomNetwork(Network):
     def apply_remote_best(self, slug: str, vram: int, score: int, source: str) -> None:
         proj = self._project(slug)
         with self.store.tx() as db:
-            db.execute("UPDATE functions SET best_score=?, best_source=? WHERE project_id=? AND vram=? AND status='open' "
-                       "AND (best_score IS NULL OR best_score > ?)", (score, source, proj["id"], vram, score))
+            db.execute("UPDATE functions SET best_score=?, best_source=?, best_at=?, stale_visits=0 WHERE project_id=? "
+                       "AND vram=? AND status='open' AND (best_score IS NULL OR best_score > ?)",
+                       (score, source, time.time(), proj["id"], vram, score))
 
     def apply_remote_note(self, slug: str, host_id: int, vram: int | None, text: str, agent_name: str, created_at: float) -> None:
         proj = self._project(slug)
@@ -1431,7 +1433,7 @@ class RomNetwork(Network):
             cfg["priority"] = ([fn["name"]] + items) if on else items
         return self._update_cfg(slug, change)["priority"]
 
-    def claim_row(self, agent: Agent, project: str | None = None, function: str | None = None, strategy: str = "easiest"):
+    def claim_row(self, agent: Agent, project: str | None = None, function: str | None = None, strategy: str = "shuffle"):
         if function is None and project and not self.fork_slug(project):
             proj = self._project(project)
             now = time.time()
@@ -1443,8 +1445,8 @@ class RomNetwork(Network):
                     continue
                 # the same rules as every automatic claim: not one this agent gave up on lately, nor one anybody released
                 # within the cooldown (else the queue hands the same stuck function back again and again), nor one
-                # left for the permuter or a human, and only what suits the agent's model
-                if self.routing_on() and not self.unrouted(agent) and self.store.one(
+                # left for the permuter or a human, and within the agent's size limit
+                if self.store.one(
                         "SELECT 1 FROM events WHERE project_id=? AND kind='release' AND detail=? "
                         "AND ((agent_id=? AND created_at > ?) OR created_at > ?)", proj["id"], name, agent.id,
                         now - network.RELEASE_RETRY, now - network.RELEASE_COOLDOWN):

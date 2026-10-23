@@ -86,3 +86,23 @@ def test_mips_code_no_compiler_makes():
     assert mips_reason(prologue, False, "psx") is None
     assert mips_reason(le(0x8D020000, 0x03E00008, 0), False, "ps2") is None  # lw v0, 0(t0) on the PS2: an argument
     assert mips_reason(le(0x03E00008, 0, 0, 0), False, "psx") is None  # alignment padding after jr ra
+
+
+def test_playstation_code_no_compiler_makes():
+    """slus-00844 (a PS1 game): agents kept getting four small pieces no C can produce, a hundred notes each: a trapping
+    addi, two stack-switching wrappers and a jump through a register into the scratchpad. None of the game's 1,600
+    matched functions does any of these, and compiled code that looks a bit like them still passes."""
+    from decompnet.handwritten import mips_reason
+
+    ret = (0x03E00008, 0)  # jr ra; nop
+    assert "trapping" in mips_reason(le(0x20E7FFFF, *ret), False, "psx")  # addi a3, a3, -1
+    assert mips_reason(le(0x24E7FFFF, *ret), False, "psx") is None  # addiu a3, a3, -1: what GCC emits
+    assert mips_reason(le(0x20E7FFFF, *ret), False, "n64") is None  # only claimed for the PlayStation
+    assert "stack pointer" in mips_reason(le(0x3C1D1F80, *ret), False, "psx")  # lui sp, 0x1F80
+    # a frame pointer: GCC restores $sp from $fp (move sp, fp), which is fine
+    fp = le(0x27BDFFE8, 0xAFBE0010, 0x03A0F021, 0x03C0E821, 0x8FBE0010, 0x03E00008, 0x27BD0018)
+    assert mips_reason(fp, False, "psx") is None
+    # lui t0, 0xA000; addiu t0, t0, -0x2080; jalr t0; nop (and then the next function)
+    assert "indirect call" in mips_reason(le(0x3C08A000, 0x2508DF80, 0x0100F809, 0), False, "psx")
+    # a direct call to a function that never returns can end compiled code: not claimed
+    assert mips_reason(le(0x27BDFFE8, 0xAFBF0010, 0x0C000000, 0), False, "psx") is None

@@ -1,4 +1,4 @@
-# Changes in this fork: model tiers, target routing, permuter handoffs, overlay fixes
+# Changes in this fork
 
 2026-10-17. On top of `decomp.wtf-chocobo`. Tested on macOS with the project's test suite: 117 pass (102 before;
 the new `tests/test_tiers.py` plus two outdated update tests fixed). No test that passed before fails now. The
@@ -151,3 +151,50 @@ The Agents tab launcher has a **Disable tiers** checkbox. Ticked, the helpers it
 `tier: "any"`: no size or give-up caps, and what was left for the permuter or a human, and what the helper released
 lately, come last instead of being blocked (`Network.unrouted`). It works with the global **Model tiers** setting
 on or off, so one launch can ignore the tiers while others keep them.
+
+## 5. Model tiers removed; a weighted claim queue; the header gate; more hand-written code set aside (2026-10-22)
+
+From slus-00844's data: 51 open functions (9%) had absorbed 42% of all visits that didn't improve anything; every new
+helper started on the smallest open functions, by then mostly code no C can produce; and context.h hadn't changed in
+three days.
+
+- **Model tiers are gone.** That means `tiers.py`, the "Model tiers" setting, the launcher's "Disable tiers" box, the
+  endpoint's "Work it gets", the tier role text in the prompt, and the per-tier tool, batch and leash rules. Every
+  helper is treated the same.
+  - The one knob left: "Largest function (instructions)", per launch or per endpoint (`max_insns`), for a weak local
+    model. A helper whose limit leaves nothing open stops.
+  - `diff_kind` moved to `scoring.py`. The `agents.tier` column stays, unused.
+- **The claim queue picks at random, weighted** (`Network._next_for`, `_weight`; strategy "shuffle", the default).
+  - Every claim that ended without beating the function's best score makes it less likely: 1 / (1 + visits/4)².
+    Stuck functions sink but never vanish.
+  - Improved in the last day: twice as likely. Twins count as before. Released by anyone in the last 15 minutes:
+    much less likely.
+  - Functions left for a human never come automatically. In the old tiers-off path they did.
+  - Functions that are the permuter's (left for it, or only registers/order differ, while it has runs left) come only
+    when nothing else is left, or to a helper started with `strategy="order-only"`.
+  - The fixed orders (finish, easiest, closest, hardest, random) are still there when asked for. Forks keep "finish".
+  - New columns: `functions.best_at` (when the best score was reached) and `functions.stale_visits` (claims since
+    then that didn't beat it), counted once from history on the first start.
+  - A release, or a lease that runs out, counts a visit. A better score resets the count.
+- **The permuter gets two rounds of 3 runs** (`PERMUTER_ROUNDS`) before a near miss goes back to the agents. With
+  slus-00844's `tools/permute/dp_worker.py` patch, the second round's runs are three times as long.
+- **The header gate** (`edit_context`, both `rename_symbol`s): an edit is rejected only for matched functions it
+  breaks itself. `Network.already_failing` finds the ones that already fail with the current headers (a declaration
+  that changed since they matched, a toolchain change), cached per header version and set of matched functions. The
+  reply names them, so they can be fixed on their own. Before, one such function blocked every edit, even a comment.
+- **Stall stop for everyone:** `HARD_STOP` (3) times the nudge without beating your best, and compile_and_diff refuses
+  the function until you release it. Before, only the small tiers had one, at 2x.
+- **More code no compiler makes, set aside automatically** (`handwritten.py`, PlayStation only):
+  - trapping `add`/`addi`/`sub`;
+  - setting `$sp` from anything but `$sp`/`$fp`;
+  - ending in an indirect call (`jalr`) with no return after it.
+
+  Checked on every function of slus-00844: none of its 1,600 matched functions does any of these, and they catch
+  exactly the four stubs agents had left a hundred notes each on (func_80044324, func_8003F23C, func_8003F1F0,
+  func_8004782C). The existing pass sets them aside the next time helpers start.
+- **API helpers wait up to 900 seconds for a reply** (it was 300): `API_REPLY_TIMEOUT`, or the endpoint's "Reply
+  timeout".
+- **Work prompt:** what no C can produce goes `leave_for="human"` with the reason, and a missing macro, type or
+  prototype is added with edit_context instead.
+- **Tests:** `tests/test_queue.py` (replaces `test_tiers.py`), `tests/test_header_gate.py`, a PlayStation case in
+  `tests/test_handwritten.py`, and an updated endpoint test.

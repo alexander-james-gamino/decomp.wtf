@@ -62,12 +62,15 @@ MIGRATIONS = [
     ("functions", "rom_offset", "INTEGER"),                    # ROM projects: where its bytes are in the ROM
     ("functions", "meta", "TEXT"),                             # forks: symbol, demangled name, source file
     ("functions", "boost", "INTEGER NOT NULL DEFAULT 0"),      # claim order: >0 matching it matches that many twins
-    ("agents", "tier", "TEXT"),                                # model tier (tiers.py): local | small | medium | large
+    ("agents", "tier", "TEXT"),                                # (unused since model tiers were removed)
     ("functions", "handoff", "TEXT"),                          # left for: permuter | human (no automatic claims)
     ("functions", "handoff_note", "TEXT"),                     # why it was left, by whom
     ("functions", "handoff_at", "REAL"),
     ("functions", "best_kind", "TEXT"),                        # the best attempt's diff: regalloc | structure | data
     ("functions", "permuter_turns", "INTEGER NOT NULL DEFAULT 0"),  # permuter runs on it that didn't match
+    ("functions", "best_at", "REAL"),                          # when the best score was reached
+    ("functions", "stale_visits", "INTEGER NOT NULL DEFAULT 0"),  # claims since then that didn't beat it
+    ("agents", "max_insns", "INTEGER"),                        # largest function it's handed automatically (empty: any)
 ]
 
 
@@ -122,6 +125,23 @@ class Store:
                         text LIKE '%regalloc only%' OR text LIKE '%regalloc-only%' OR text LIKE '%permuter only%'
                         OR text LIKE '%only: permuter%' OR text LIKE '%leave it to the permuter%'));
                 INSERT INTO settings(key, value) VALUES('handoffs_from_notes', '1');
+                COMMIT;""")
+        # before the claim queue weighed functions by visits without progress, nothing recorded either: once, when
+        # each best score was reached (its first attempt with that score) and how many claims ended since then
+        if self.conn.execute("SELECT 1 FROM settings WHERE key='stale_visits_counted'").fetchone() is None:
+            self.conn.executescript("""
+                BEGIN;
+                UPDATE functions SET best_at = (SELECT MIN(a.created_at) FROM attempts a
+                                                WHERE a.function_id=functions.id AND a.score=functions.best_score)
+                  WHERE best_score IS NOT NULL AND best_at IS NULL;
+                CREATE TEMP TABLE visits AS SELECT project_id, detail AS name, created_at FROM events
+                  WHERE kind IN ('release', 'expired');
+                CREATE INDEX temp.visits_name ON visits(project_id, name);
+                UPDATE functions SET stale_visits = (SELECT COUNT(*) FROM visits v WHERE v.project_id=functions.project_id
+                                                     AND v.name=functions.name AND v.created_at > COALESCE(functions.best_at, 0))
+                  WHERE status='open';
+                DROP TABLE visits;
+                INSERT INTO settings(key, value) VALUES('stale_visits_counted', '1');
                 COMMIT;""")
         self.lock = threading.RLock()
 

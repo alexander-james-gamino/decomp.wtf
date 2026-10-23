@@ -28,7 +28,6 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from .. import tiers
 from . import tools
 from .engine import RomNetwork
 
@@ -87,14 +86,22 @@ ALIASES = {"gemini": "antigravity", "agy": "antigravity"}
 # this rule in the user's agy settings allows decomp.wtf's tools (and nothing else).
 AGY_ALLOW = "mcp(decomp/*)"
 
-# The tools a local model gets (tiers.py "local"): the loop itself plus what it needs to read data and ask for
-# help. Every definition costs a slow local model prompt-reading time, and fewer choices keep it on track.
-LOCAL_TOOLS = {"claim_function", "compile_and_diff", "release_function", "get_context", "read_data", "find_similar",
-               "add_note", "get_function"}
+# How long an API helper waits for one reply. A model on your own GPU serving several sessions at once, thinking at
+# length over a big function's brief, can take minutes for a turn; an endpoint can set its own ("reply_timeout").
+API_REPLY_TIMEOUT = 900
 
 # Functions per helper session: a fresh session starts with a small, clean context (each function's assembly,
 # drafts and diffs would otherwise ride along into the next one): cheaper per call, and the model stays sharp.
 PER_SESSION = 2
+
+
+def _positive(value) -> int | None:
+    """A whole number above 0 from a setting (text from the GUI, or a number), else None."""
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
 
 
 def kind_id(kind: str) -> str:
@@ -589,15 +596,8 @@ class Manager:
         self._prep: dict[str, threading.Event] = {}  # slug -> giving its code source files before agents claim
         self.on_stop = lambda: None  # set by the server: close tunnels when the app quits
         self.persist = lambda running: None  # set by the server: remember helpers to resume after a restart
-        self.tiers_on = lambda: False  # set by the server from the settings (the GUI toggle); off: no tier routing
 
     # -- control
-
-    def _tier(self, s: Session) -> tiers.Tier | None:
-        """This helper's tier (tiers.py) when model tiers are on; None when off: every helper can claim anything."""
-        if not self.tiers_on():
-            return None
-        return tiers.get(tiers.detect(s.kind, s.options, is_local))
 
     def start(self, kind: str, slug: str, count: int = 1, options: dict | None = None) -> list[str]:
         options = dict(options or {})
@@ -724,13 +724,9 @@ class Manager:
     def _run(self, s: Session) -> None:
         agent, token = self.net.local_agent(s.agent_name)
         self.assignments[agent.id] = s.slug
-        tier = self._tier(s)
-        unrouted = str(s.options.get("tier") or "").strip().lower() == "any"
-        # what it's handed (tiers.py); None: everything; "any": tiers disabled for this helper (it may also
-        # be handed what was left for the permuter, and what it released lately)
-        self.net.set_agent_tier(agent.id, "any" if unrouted else (tier.name if tier else None))
-        if unrouted:
-            tier = None
+        # the largest function it's handed automatically (the helper's or its endpoint's setting); None: any size
+        limit = _positive(s.options.get("max_insns"))
+        self.net.set_agent_limit(agent.id, limit)
         workdir = self.home / "agents" / s.id
         workdir.mkdir(parents=True, exist_ok=True)
         failures = throttles = 0
@@ -747,11 +743,9 @@ class Manager:
             if self._left(s.slug) == 0:
                 s.push("info", "nothing left to decompile here 🎉")
                 break
-            if tier is not None and self.net.left_for(agent, s.slug) == 0:
-                # everything open is too big or too hard for this model, or waits for the permuter: stop rather than
-                # burn compiles on it
-                s.push("info", f"nothing left that suits a {tier} model ({self._left(s.slug)} functions are open: "
-                               "they need a stronger model or the permuter). Stopping this helper.")
+            if limit is not None and self.net.left_for(agent, s.slug) == 0:
+                s.push("info", f"nothing open of {limit} instructions or fewer ({self._left(s.slug)} functions are open, "
+                               "all bigger). Stopping this helper.")
                 break
             if (cap := self.over_budget(s.slug)) is not None:
                 s.push("info", f"stopping: the agents on this project have spent the ${cap:.2f} budget (Setup)")
@@ -842,19 +836,16 @@ class Manager:
         # for hybrid models like Qwen 3.8 only works when the new prompt continues the cached one exactly)
         if (wish := self.net.instructions(s.slug)):
             text += f"\nThe user's instructions for this project (they come first):\n{wish}\n"
-        if (t := self._tier(s)) is not None:
-            text += f"\nYour role here ({t.name} model; claim_function picks functions that suit it):\n{t.guidance}\n"
         if (learned := self.net.learnings(s.slug)):
             text += ("\nThe newest project notes (add yours with add_note and no function"
                      + ("; the essentials are in the user's instructions above" if wish else "") + f"):\n{learned}\n")
         return text
 
     def _per_session(self, s: Session) -> int:
-        """Claims per session: the helper's own setting, else its tier's (a local model: one), else the default."""
+        """Claims per session: the helper's own setting, else the default."""
         if s.options.get("per_session"):
             return int(s.options["per_session"])
-        t = self._tier(s)
-        return t.per_session if t is not None else PER_SESSION
+        return PER_SESSION
 
     def _prompt(self, s: Session) -> str:
         ov = self.net.overview(s.slug)
@@ -1028,13 +1019,11 @@ class Manager:
         if s.options.get("api_key"):
             headers["Authorization"] = f"Bearer {s.options['api_key']}"
         schema = api_tool_schemas(fork=bool(self.net.fork_slug(s.slug)))
-        if (local := self._tier(s)) is not None and local.name == "local":
-            # a small model stays on track with fewer tools
-            schema = [t for t in schema if t["function"]["name"] in LOCAL_TOOLS] or schema
         messages = [{"role": "system", "content": tools.INSTRUCTIONS},
                     {"role": "user", "content": self.prompt(s)}]
         used_tool = False
-        with httpx.Client(timeout=httpx.Timeout(300, connect=15)) as client:
+        wait = _positive(s.options.get("reply_timeout")) or API_REPLY_TIMEOUT
+        with httpx.Client(timeout=httpx.Timeout(wait, connect=15)) as client:
             window = context_window(client, base, s.options)
             s.push("info", f"session {s.runs}: {model} via {base} ({window // 1000}K tokens of context)")
             budget = int(window * 0.7) - _tokens(schema)  # room for the reply and the tools' definitions
@@ -1148,7 +1137,7 @@ def api_tool_schemas(fork: bool = False) -> list[dict]:
         "project_info": ("Which game, compiler and progress.", s()),
         "claim_function": ("Claim the next function (or one by name/address). Returns assembly, data, best attempt, "
                            "notes and a draft. count > 1: a batch of small functions to judge together.",
-                           s(function=st("optional name or address"), strategy=st("finish | easiest | closest | hardest | random"),
+                           s(function=st("optional name or address"), strategy=st("empty: the usual weighted pick; or finish | easiest | closest | hardest | random | order-only"),
                              count=it("up to 6 small functions at once"))),
         "get_function": ("Show any function by name or address. page: 1, 2, ... for more of a long function's assembly; "
                          "-1 for its whole best attempt or draft.",

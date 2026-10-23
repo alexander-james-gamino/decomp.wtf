@@ -71,10 +71,11 @@ def test_the_session_prompt_keeps_what_changes_for_last():
 
     m = agents.Manager.__new__(agents.Manager)
     m.net = Net()
-    m.tiers_on = lambda: True  # the role text only appears when the Model tiers setting is on
     s = agents.Session("claude-1", "claude", "c", "game", "claude-1", {"model": "haiku"})
     prompt = agents.Manager.prompt(m, s)
-    assert prompt.index("USER INSTRUCTIONS") < prompt.index("Your role here (small model") < prompt.index("NEWEST NOTE")
+    assert prompt.index("USER INSTRUCTIONS") < prompt.index("NEWEST NOTE")
+    assert "Your role here" not in prompt  # model tiers are gone: every helper gets the same prompt
+    assert 'leave_for="human"' in prompt and "trapping" in prompt  # what no C can produce goes to a human
     assert prompt.rstrip().endswith("- NEWEST NOTE")
     assert "DIGEST:" in prompt  # the work prompt asks for the digest before a release
     assert network.ASM_PAGE_LINES == 450

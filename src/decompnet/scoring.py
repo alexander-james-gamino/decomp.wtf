@@ -320,3 +320,20 @@ def diff(target: FunctionObj, candidate: FunctionObj) -> DiffResult:
     if bytes_match:
         score = 0
     return DiffResult(score=score, max_score=max_score, rows=rows, bytes_match=bytes_match)
+
+
+def diff_kind(d: DiffResult, verdict: bool | None = None) -> str | None:
+    """What a non-matching attempt's diff says about the work left:
+    regalloc  - the same instructions, only registers, order or stack offsets differ: the permuter's job
+    data      - every instruction reads the same, only bytes or data differ (a jump table, strings, constants,
+                or a tool problem): no rewrite of the code helps
+    structure - missing, extra or different instructions: C work
+    None for a match."""
+    if d.bytes_match and verdict is not False:
+        return None
+    marks = {m for m, _, _ in d.rows if m != " "}
+    if not marks:
+        return "data"
+    if marks <= {"r", "o", "s"}:
+        return "regalloc"
+    return "structure"

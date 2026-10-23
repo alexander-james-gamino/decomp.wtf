@@ -62,7 +62,7 @@ functions of the same game at the same time; the tools keep you from colliding.
 Your job: turn functions of this game into C that compiles to *exactly* the original machine code.
 Use only the decomp tools. Repeat for up to {count} claims (a batch is one), then stop:
 
-1. claim_function(count=4) gives you the next function that suits you, and when it's small, its neighbours
+1. claim_function(count=4) gives you the next function, and when it's small, its neighbours
    with it (small functions mostly match on the first try): assembly, location, calls, data it uses, the best
    previous attempt and notes (start from those!), a machine-generated draft, and identical matched code if any.
 2. get_context() shows the shared header every compile includes.
@@ -77,8 +77,10 @@ Use only the decomp tools. Repeat for up to {count} claims (a batch is one), the
 5. compile_and_diff says when to move on (no better after a few compiles in a row; more for big functions).
    Before you release, update the function's status digest: add_note with function set and a text like
    "DIGEST: best 40; tried A, B; left: C; next: D". It heads the next agent's brief. Then release_function. Only
-   registers or instruction order differ: release_function with leave_for="permuter". Every instruction matches
-   but data still differs and you've checked your data: leave_for="human", saying what you checked.
+   registers or instruction order differ: release_function with leave_for="permuter". No C can produce it
+   (hand-written assembly, a trapping add/addi/sub, writing $sp, a jump into a fixed address), or every
+   instruction matches but data still differs and you've checked your data: leave_for="human", saying why.
+   A macro, type or prototype the shared header lacks is not a reason: add it with edit_context.
 
 A switch's case numbers come only from its jump table: read_data the jtbl_ address and label each case by where
 its entry points (bodies can be shared or fall through). Write plausible original code, pure C (no inline asm).
@@ -272,9 +274,11 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]])
 
         Args:
             function: optional name or address (0x80001234) of a specific function
-            strategy: leave empty: you get what suits your model. Or finish (files closest to being linked
-                first), easiest (fewest instructions), closest (nearly matched already), frontier (what
-                weaker models can't do), hardest, random
+            strategy: leave empty for the usual pick: at random, weighted towards functions that are
+                making progress and away from ones many agents already tried without progress. Or finish
+                (files closest to being linked first), easiest (fewest instructions), closest (nearly
+                matched already), hardest, random, or order-only (only near misses where just registers or
+                instruction order differ: for a helper started on those on purpose)
             count: up to 6: small functions come as a batch (neighbours in one file) to write together and
                 judge in one compile_and_diff; a big one comes alone
         """

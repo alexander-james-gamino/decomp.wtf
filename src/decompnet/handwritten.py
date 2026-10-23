@@ -17,7 +17,11 @@ the PlayStations, coprocessor 2 (the PS1's GTE, the PS2's VU0: ctc2, mtc2, lwc2,
 never emit (PSY-Q's libgte is written in assembly; C that drives the GTE does it with inline asm, which decomp.wtf
 doesn't take); code that ends without a return or a jump and so runs on into the next function (an extra entry
 point into hand-written code: the splitter cut it off); or a first block that reads a temporary register (at, v0,
-v1, t0-t9) or k0/k1 before setting it (compiled code gets its arguments in a0-a3).
+v1, t0-t9) or k0/k1 before setting it (compiled code gets its arguments in a0-a3). On the PlayStation also: trapping
+arithmetic (add, addi, sub: GCC emits addu, addiu, subu), setting $sp from anything but $sp or $fp (compiled code only
+moves the stack pointer by a constant, or restores it from the frame pointer: stack-switching wrappers do the rest),
+and ending in an indirect call with no return after it (a jump through a register into a fixed address, such as a
+scratchpad or BIOS vector, that then runs on into the next function).
 """
 
 from __future__ import annotations
@@ -144,6 +148,16 @@ def _mips_transfer(w: int) -> bool:
     return op == 1 and (w >> 21) & 31 == 0 and (w >> 16) & 31 in (1, 17)  # bgez/bgezal zero
 
 
+def _mips_trapping(w: int) -> bool:
+    """add, addi, sub: the arithmetic that traps on overflow, which GCC never emits for C (it uses addu, addiu, subu)."""
+    op = w >> 26
+    return op == 8 or (op == 0 and (w & 0x3F) in (0x20, 0x22))
+
+
+def _mips_jalr(w: int) -> bool:
+    return (w >> 26) == 0 and (w & 0x3F) == 9
+
+
 def _mips_branch(w: int) -> bool:
     op = w >> 26
     return _mips_transfer(w) or op in (1, 4, 5, 6, 7, 0x14, 0x15, 0x16, 0x17) or (op in (0x11, 0x12) and (w >> 21) & 31 == 8)
@@ -227,6 +241,20 @@ def mips_reason(code: bytes, big_endian: bool, platform: str = "", cop2: bool = 
     if not any(_mips_transfer(w) for w in body[-2:]):
         return ("ends without a return or a jump, so it runs on into the next function: an entry point inside "
                 "hand-written code (compiled functions end with jr ra)")
+    if platform in ("psx", "ps"):
+        # (checked on every function of a PlayStation game: none of its 1,600 matched functions does any of these)
+        if any(_mips_trapping(w) for w in words):
+            return "uses trapping arithmetic (add, addi or sub): GCC emits addu, addiu and subu for C"
+        for w in words:
+            uses = _mips_uses(w)
+            if uses is not None and 29 in uses[1] and not uses[0] & {29, 30}:
+                return ("sets the stack pointer from something other than itself or the frame pointer (a stack "
+                        "switch): compiled code only moves $sp by a constant")
+        tail = body[-2:]
+        if any(_mips_jalr(w) for w in tail) and not any(_mips_transfer(w) and not _mips_jalr(w) and (w >> 26) != 3
+                                                          for w in tail):
+            return ("ends in an indirect call with no return after it (a jump into a fixed address that runs on "
+                    "into the next function): compiled functions end with jr ra")
     names = {1: "at", 2: "v0", 3: "v1", 24: "t8", 25: "t9", 26: "k0", 27: "k1"}
     # the PS2's EABI passes eight integer arguments: a0-a3 and t0-t3
     temps = _MIPS_TEMPS - {8, 9, 10, 11} if platform == "ps2" else _MIPS_TEMPS
