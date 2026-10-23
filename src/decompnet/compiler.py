@@ -6,6 +6,7 @@ every match is produced here, on the coordinator, with the project's pinned tool
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
@@ -33,6 +34,93 @@ _FORBIDDEN = [
     (re.compile(r"#\s*include\s*<"), "system includes are not allowed; everything you need is in context.h"),
 ]
 _INCLUDE = re.compile(r'#\s*include\s*"([^"]+)"')
+
+# The shared header may hold macros that emit coprocessor 2 instructions (the PlayStation's GTE, which C can't drive
+# any other way) with the loads and stores that feed them, and register pins (`register T x asm("$N")`). Nothing else:
+# a macro that pastes in ordinary instructions turns the original's assembly into a "match". On slus-00844, 43
+# functions were "matched" in a day through ASM_BODY("<the whole function's assembly>") and helpers like it.
+_GTE_OPS = {"mtc2", "mfc2", "ctc2", "cfc2", "lwc2", "swc2"}
+_FEEDS_GTE = {"lw", "lh", "lhu", "lb", "lbu", "sw", "sh", "sb"}
+_ASM_START = re.compile(r"\b(?:__asm__|__asm|asm)\b\s*(?:__volatile__|volatile)?\s*\(")
+_PIN = re.compile(r'\s*"\$\w+"\s*\)')  # asm("$17") after a register declaration: a pin, not assembly
+_STRING = re.compile(r'"((?:\\.|[^"\\])*)"')
+
+
+def _asm_problem(template_args: str) -> str | None:
+    """Why one asm statement's first argument (everything after its opening parenthesis) isn't GTE-only, or None."""
+    at, text, parts = 0, template_args, []
+    while True:
+        rest = text[at:].lstrip()
+        if rest.startswith('"'):
+            m = _STRING.match(rest)
+            if not m:
+                return "its assembly isn't a plain string"
+            parts.append(m.group(1))
+            at = len(text) - len(rest) + m.end()
+            continue
+        if rest.startswith("#"):
+            return "builds its assembly from a macro argument (#x)"
+        if not parts:
+            return "its assembly comes from a macro argument"
+        break
+    stmts = [x.strip() for x in re.split(r";|\\n", "".join(parts).replace("\\t", " ")) if x.strip()]
+    mnemonics = set()
+    for st in stmts:
+        if re.match(r"^[\w.$]+\s*:", st):
+            return "has a label (a branch target)"
+        op = st.split()[0].lower()
+        if op == ".word":
+            for v in st.split(None, 1)[1].split(",") if len(st.split()) > 1 else []:
+                try:
+                    if (int(v.strip(), 0) >> 26) != 0x12:
+                        return f".word {v.strip()} isn't a GTE command"
+                except ValueError:
+                    return f".word {v.strip()} isn't a number"
+            mnemonics.add("cop2")
+        elif op in _GTE_OPS:
+            mnemonics.add("cop2")
+        elif op in _FEEDS_GTE:
+            mnemonics.add("load/store")
+        elif op not in ("nop", ".set"):
+            return f"uses {op}, which C would have to produce"
+    if "load/store" in mnemonics and "cop2" not in mnemonics:
+        return "loads or stores without a GTE instruction"
+    return None
+
+
+def header_asm_problems(header: str) -> dict[str, str]:
+    """{macro name: why} for the macros of a shared header that paste in assembly C couldn't produce (see above). An asm
+    statement outside any macro is reported under "<header>"."""
+    return dict(_header_asm_problems(header))
+
+
+@functools.lru_cache(maxsize=16)
+def _header_asm_problems(header: str) -> tuple:
+    code = re.sub(r"\\\r?\n", " ", re.sub(r"//[^\n]*|/\*.*?\*/", " ", header, flags=re.S))
+    found: dict[str, str] = {}
+    for line in code.splitlines():
+        m = re.match(r"\s*#\s*define\s+(\w+)", line)
+        name = m.group(1) if m else "<header>"
+        for a in _ASM_START.finditer(line):
+            after = line[a.end():]
+            if _PIN.match(after):
+                continue
+            why = _asm_problem(after)
+            if why and name not in found:
+                found[name] = why
+    return tuple(found.items())
+
+
+def check_header_use(source: str, header: str) -> None:
+    """A source may not use a header macro that pastes in assembly (header_asm_problems)."""
+    bad = header_asm_problems(header)
+    if not bad:
+        return
+    code = _COMMENTS_AND_STRINGS.sub(" ", source)
+    for name, why in bad.items():
+        if name != "<header>" and re.search(rf"\b{re.escape(name)}\b", code):
+            raise SourceRejected(f"{name} (context.h) pastes in assembly ({why}): matches must come from C. "
+                                 "context.h macros are for the GTE and register pins only")
 
 
 class SourceRejected(ValueError):
@@ -136,6 +224,7 @@ def compile_source(cfg: CompilerConfig, context_header: str, source: str, truste
     if not trusted:
         try:
             check_source(source)
+            check_header_use(source, context_header)
         except SourceRejected as e:
             return CompileResult(False, None, f"rejected: {e}")
 

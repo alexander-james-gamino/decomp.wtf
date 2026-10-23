@@ -83,7 +83,8 @@ Use only the decomp tools. Repeat for up to {count} claims (a batch is one), the
    A macro, type or prototype the shared header lacks is not a reason: add it with edit_context.
 
 A switch's case numbers come only from its jump table: read_data the jtbl_ address and label each case by where
-its entry points (bodies can be shared or fall through). Write plausible original code, pure C (no inline asm).
+its entry points (bodies can be shared or fall through). Write plausible original code, pure C: no inline asm,
+and no assembly through context.h macros either (those are for the GTE and register pins only).
 Be brief in your messages: work, don't narrate.
 """
 

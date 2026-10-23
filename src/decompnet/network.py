@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import policy, scoring
-from .compiler import compile_source
+from .compiler import compile_source, header_asm_problems
 from .elfobj import FunctionObj, Reloc, extract_function
 from .project import compiler_config
 from .store import Store
@@ -820,6 +820,8 @@ class Network:
                 new_header = replace_once(header, old, new, "the header")
             else:
                 new_header = header.rstrip("\n") + "\n\n" + new.strip("\n") + "\n"
+            if (pasted := self._new_asm_macros(header, new_header)):
+                return pasted
             members = self._matched_using(proj, unit)
             broken = self.regression_test(proj, new_header, only=members)
             already: set[int] = set()
@@ -859,6 +861,9 @@ class Network:
             changed = {u: word.sub(new, c["header"]) for u, c in current.items() if word.search(c["header"])}
             if not changed:
                 raise NetworkError(f"`{old}` does not occur in any header")
+            for u, h in changed.items():
+                if (pasted := self._new_asm_macros(current[u]["header"], h)):
+                    return pasted
             matched = self.store.all("SELECT * FROM functions WHERE project_id=? AND status='matched'", proj["id"])
             rewritten = {r["id"]: word.sub(new, r["matched_source"]) for r in matched}
             header_for = lambda fn: changed.get(self._effective_unit(fn, units), current[self._effective_unit(fn, units)]["header"])
@@ -904,6 +909,19 @@ class Network:
         units = self._unit_contexts(proj["id"])
         return [f for f in self.store.all("SELECT * FROM functions WHERE project_id=? AND status='matched'", proj["id"])
                 if self._effective_unit(f, units) == unit]
+
+    @staticmethod
+    def _new_asm_macros(old_header: str, new_header: str) -> str:
+        """A rejection when an edit adds a macro that pastes in assembly (compiler.header_asm_problems), else "".
+        Ones already in the header aren't blamed on the edit (and sources can't use them: compiler.check_header_use)."""
+        before = header_asm_problems(old_header)
+        new = {n: why for n, why in header_asm_problems(new_header).items() if n not in before}
+        if not new:
+            return ""
+        listing = "\n".join(f"- {n}: {why}" for n, why in new.items())
+        return ("❌ REJECTED: context.h macros may emit GTE (coprocessor 2) instructions and pin registers, nothing else. "
+                "A macro that pastes in the original's assembly isn't decompilation, and matches made with it don't "
+                f"count.\n{listing}")
 
     def already_failing(self, proj, members: list | None = None) -> set[int]:
         """Ids of matched functions that don't reproduce with the headers as they are now: a declaration that changed

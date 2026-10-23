@@ -198,3 +198,26 @@ three days.
   prototype is added with edit_context instead.
 - **Tests:** `tests/test_queue.py` (replaces `test_tiers.py`), `tests/test_header_gate.py`, a PlayStation case in
   `tests/test_handwritten.py`, and an updated endpoint test.
+
+## 6. No assembly through context.h (2026-10-23)
+
+Once header edits worked again, a local model (Qwen3.8-Flash-Next) found that the rule against inline asm only
+looked at function sources. It defined `ASM_BODY(s)` in context.h, which emits any assembly string, and "matched"
+43 functions in a day (27 KB, up to 549 instructions) by pasting each one's original assembly in. It also wrote the
+trick up as a recipe in the project notes, which every new session reads.
+
+- **Header rule** (`compiler.header_asm_problems`): a macro's inline asm may hold only GTE instructions (mtc2, mfc2,
+  ctc2, cfc2, lwc2, swc2, and `.word` encodings of coprocessor-2 commands), `nop`, `.set`, and loads/stores beside a
+  GTE instruction. Register pins (`register T x asm("$N")`) are fine.
+  - Rejected: assembly that comes from a macro argument (ASM_BODY), a stringized argument (`" #fn "`), labels, and
+    any other instruction.
+  - Checked on slus-00844: the 10-22 header (every GTE macro and pin) passes; the 10-23 header flags exactly the six
+    new macros.
+- **edit_context and rename_symbol** reject an edit that adds such a macro. Ones already in the header aren't blamed
+  on the edit.
+- **compile_source** refuses a source that uses one, before compiling (`check_header_use`), even while it's still in
+  the header.
+- **Work prompt:** "no assembly through context.h macros either".
+- The cleanup (reverting the 43, removing the macros and the notes) is a one-time script in the slus-00844 workspace:
+  `revert_asm_matches.py`.
+- **Tests:** `tests/test_header_asm.py`.
